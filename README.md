@@ -9,8 +9,7 @@ this is an independent open-source implementation in Python on top of libusb.
 ![Thermal image of a running PC motherboard](docs/example-motherboard.png)
 
 A running PC motherboard, `uti120 snapshot` with the default ironbow palette:
-120×90 sensor pixels upscaled ×4, 8 frames averaged. Warm areas are the chips
-and VRM components; the dark rectangles are cool, reflective parts.
+120×90 sensor pixels upscaled ×4, 8 frames averaged; brighter is warmer.
 
 ## Install
 
