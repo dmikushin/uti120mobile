@@ -58,6 +58,15 @@ def replace_pixels(img: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return out
 
 
+def row_stripes(img: np.ndarray) -> float:
+    """Strength of row-wise offsets: median |2nd difference| of row medians.
+
+    A calibrated frame of a real scene measures ~8-10 counts; frames taken
+    while the camera's NUC is still settling measure 30-240.
+    """
+    return float(np.median(np.abs(np.diff(np.median(img, axis=1), 2))))
+
+
 class AutoGain:
     """Maps the signal to [0, 1] between low/high percentiles, smoothed over time."""
 

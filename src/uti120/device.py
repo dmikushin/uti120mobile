@@ -194,6 +194,14 @@ class Camera:
 
     def start(self):
         self.set_run_status(RUN_STREAM)
+        # The first frame after (re)starting is the one the camera prepared
+        # when streaming last stopped, possibly long ago (measured: always the
+        # previous session's last frame id + 1, while the 16-bit counter keeps
+        # running at 25 Hz and wraps every ~44 min).  Discard it and start the
+        # frame-order check afresh.
+        self.last_frame_id = None
+        self.grab()
+        self.last_frame_id = None
 
     def stop(self):
         self.set_run_status(RUN_IDLE)

@@ -150,6 +150,16 @@ def test_grab_drops_stale_frames(opened):
     assert cam.dev.written == [b"\x81"] * 3
 
 
+def test_start_discards_frame_left_from_previous_session(opened):
+    left_over, current = load("open4.bin.gz")[3], load("open4.bin.gz")[0]  # current id is older
+    chunks = lambda b: [b[i:i + 4096] for i in range(0, FRAME_BYTES, 4096)]
+    cam = fake_camera(cmd_replies=[bytes.fromhex("04f001")],
+                      bulk=[None] + chunks(left_over) + [None] + chunks(current))
+    cam.start()
+    assert cam.dev.written[0] == bytes.fromhex("04f00100000002")
+    assert cam.grab().frame_id == opened[0].frame_id
+
+
 def test_grab_repeats_ignored_requests():
     frame = load("open4.bin.gz")[0]
     chunks = [frame[i:i + 4096] for i in range(0, FRAME_BYTES, 4096)]

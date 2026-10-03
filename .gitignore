@@ -5,3 +5,4 @@ build/
 dist/
 *.mp4
 *.raw
+.ruff_cache/
