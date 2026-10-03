@@ -79,7 +79,7 @@ class Camera:
                 dev.detach_kernel_driver(intf)
             usb.util.claim_interface(dev, intf)
         self.dev = dev
-        self._drain_cmd()
+        self.last_frame_id = None
 
     def close(self):
         usb.util.dispose_resources(self.dev)
@@ -95,12 +95,15 @@ class Camera:
     def _drain_cmd(self):
         while True:
             try:
-                stale = bytes(self.dev.read(EP_CMD_IN, 64, 20))
+                stale = bytes(self.dev.read(EP_CMD_IN, 64, 1))
                 log.debug("discarded stale reply %s", stale.hex())
             except usb.core.USBTimeoutError:
                 return
 
     def _transact(self, request: bytes) -> bytes:
+        # A reply that arrived after an earlier timeout must not be taken for
+        # this request's reply (two shutter writes have identical replies).
+        self._drain_cmd()
         self.dev.write(EP_CMD_OUT, request, CMD_TIMEOUT_MS)
         try:
             reply = bytes(self.dev.read(EP_CMD_IN, 64, CMD_TIMEOUT_MS))
@@ -173,7 +176,16 @@ class Camera:
         """
         for attempt in range(retries):
             try:
-                return Frame.parse(self._read_frame_once())
+                f = Frame.parse(self._read_frame_once())
+                # A frame answering an earlier, timed-out request may still
+                # arrive; only frames newer than the last one are accepted
+                # (the 16-bit counter wraps).
+                if (self.last_frame_id is not None
+                        and not 0 < (f.frame_id - self.last_frame_id) % 0x10000 < 0x8000):
+                    log.warning("dropping stale frame %d (last %d)", f.frame_id, self.last_frame_id)
+                    continue
+                self.last_frame_id = f.frame_id
+                return f
             except usb.core.USBTimeoutError:
                 log.debug("frame request %d timed out", attempt)
             except FrameError as e:

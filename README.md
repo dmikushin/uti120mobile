@@ -29,7 +29,7 @@ uti120 live                                  # live window via ffplay
 
 Common options: `--palette {grey,ironbow,rainbow}`, `--scale N` (upscaling,
 default 4), `--mirror`, `--flip`, `--recalibrate SECONDS` (repeat the shutter
-calibration periodically during long recordings), `--no-nuc`, `-v` (log).
+calibration periodically during long recordings), `-v` (log).
 
 The image is relative: brighter means warmer, scaled automatically between the
 1st and 99th percentile. Radiometric temperatures are not implemented.

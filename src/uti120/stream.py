@@ -26,10 +26,9 @@ class Image:
 
 
 class Stream:
-    def __init__(self, cam: Camera, nuc: bool = True, dark_frames: int = 16,
+    def __init__(self, cam: Camera, dark_frames: int = 16,
                  recalibrate_s: float = 0.0, raw_sink=None):
         self.cam = cam
-        self.nuc = nuc
         self.dark_frames = dark_frames
         self.recalibrate_s = recalibrate_s
         self.raw_sink = raw_sink
@@ -43,16 +42,24 @@ class Stream:
         return f
 
     def start(self):
-        self.cam.start()
-        f = self._grab()
-        log.info("streaming: %s", f.describe())
-        if self.nuc:
-            log.info("on-camera NUC")
+        """Start streaming, run the on-camera NUC and calibrate on the shutter.
+
+        The NUC is not optional: the offsets the camera keeps from its last NUC
+        go stale, and then most pixels clip at 0 or 0x3FFF (observed: 8600 of
+        10800) until a new NUC is done.  On failure the camera is returned to
+        idle and released.
+        """
+        try:
+            self.cam.start()
+            log.info("streaming: %s", self._grab().describe())
             self.cam.nuc()
             end = time.monotonic() + NUC_SETTLE_S
             while time.monotonic() < end:
                 self._grab()
-        self.calibrate()
+            self.calibrate()
+        except BaseException:
+            self.stop()
+            raise
 
     def _wait_shutter(self, closed: bool):
         for _ in range(30):

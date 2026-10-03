@@ -75,7 +75,9 @@ def test_bad_pixels_are_replaced(closed):
     px = closed[0].pixels.copy()
     px[40, 60] = 0x3FFF
     out = cal.apply(px)
-    assert abs(out[40, 60] - np.median(out[39:42, 59:62])) < 100
+    neighbours = np.delete(out[39:42, 59:62].ravel(), 4)
+    assert neighbours.min() <= out[40, 60] <= neighbours.max()
+    assert cal.bad.sum() < 0.01 * px.size  # the closed-shutter frames themselves are clean
 
 
 def test_palette():
@@ -90,16 +92,19 @@ class FakeUsb:
     """Replays scripted replies for the command and bulk endpoints."""
 
     def __init__(self, cmd_replies=(), bulk=()):
-        self.cmd_replies = list(cmd_replies)
+        self.cmd_replies = list(cmd_replies)  # one per command, available once it is written
+        self.pending = []
         self.bulk = list(bulk)
         self.written = []
 
     def write(self, ep, data, timeout):
         self.written.append(bytes(data))
+        if data != b"\x81" and self.cmd_replies:
+            self.pending.append(self.cmd_replies.pop(0))
         return len(data)
 
     def read(self, ep, size, timeout):
-        queue = self.cmd_replies if ep == 0x81 else self.bulk
+        queue = self.pending if ep == 0x81 else self.bulk
         item = queue.pop(0) if queue else None
         if item is None:
             raise usb.core.USBTimeoutError("timeout", -7, 110)
@@ -109,6 +114,7 @@ class FakeUsb:
 def fake_camera(**kw):
     cam = Camera.__new__(Camera)
     cam.dev = FakeUsb(**kw)
+    cam.last_frame_id = None
     return cam
 
 
@@ -119,11 +125,29 @@ def test_register_protocol():
     assert cam.dev.written == [bytes.fromhex("050301"), bytes.fromhex("0a03010000000" + "1")]
 
 
+def test_late_reply_is_not_taken_for_next_one():
+    cam = fake_camera(cmd_replies=[bytes.fromhex("0a0301")])
+    cam.dev.pending.append(bytes.fromhex("0a0301"))  # late reply to an earlier request
+    cam.set_shutter(False)
+    assert cam.dev.pending == []
+
+
 def test_register_errors():
     with pytest.raises(DeviceError, match="no reply"):
         fake_camera().read_regs(0x05, 0x07)
     with pytest.raises(DeviceError, match="bad reply"):
         fake_camera(cmd_replies=[bytes.fromhex("0a0401")]).set_shutter(False)
+
+
+def test_grab_drops_stale_frames(opened):
+    old, new = load("open4.bin.gz")[:2]
+    chunks = lambda b: [b[i:i + 4096] for i in range(0, FRAME_BYTES, 4096)]
+    cam = fake_camera(bulk=[None] + chunks(new) + [None] + chunks(old) + [None] + chunks(new))
+    assert cam.grab().frame_id == opened[1].frame_id
+    # the older frame is rejected, the request repeated, and the same id is not accepted twice
+    with pytest.raises(DeviceError):
+        cam.grab(retries=2)
+    assert cam.dev.written == [b"\x81"] * 3
 
 
 def test_grab_repeats_ignored_requests():

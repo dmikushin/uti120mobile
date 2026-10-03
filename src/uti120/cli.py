@@ -34,7 +34,7 @@ def render(signal: np.ndarray, gain: AutoGain, args) -> np.ndarray:
 
 def open_stream(args, raw_sink=None) -> Stream:
     cam = Camera()
-    s = Stream(cam, nuc=not args.no_nuc, dark_frames=args.dark_frames,
+    s = Stream(cam, dark_frames=args.dark_frames,
                recalibrate_s=args.recalibrate, raw_sink=raw_sink)
     s.start()
     return s
@@ -128,7 +128,12 @@ class Capture(threading.Thread):
 
 def pump(args, sink_cmd: list[str], duration: float):
     raw = open(args.raw, "wb") if args.raw else None
-    s = open_stream(args, raw_sink=raw)
+    try:
+        s = open_stream(args, raw_sink=raw)
+    except BaseException:
+        if raw:
+            raw.close()
+        raise
     cap = Capture(s)
     cap.start()
     proc = subprocess.Popen(sink_cmd, stdin=subprocess.PIPE)
@@ -187,8 +192,6 @@ def main(argv=None):
     common.add_argument("--scale", type=int, default=4, help="output upscaling factor")
     common.add_argument("--mirror", action="store_true", help="flip left-right")
     common.add_argument("--flip", action="store_true", help="flip upside-down")
-    common.add_argument("--no-nuc", action="store_true",
-                        help="skip the on-camera NUC at start-up")
     common.add_argument("--dark-frames", type=int, default=16,
                         help="closed-shutter frames averaged for offset calibration")
     common.add_argument("--recalibrate", type=float, default=0.0, metavar="SECONDS",
