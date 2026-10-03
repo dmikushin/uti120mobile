@@ -4,7 +4,13 @@ Linux driver and video tools for the **UNI-T UTi120Mobile** USB thermal camera
 (120×90 microbolometer, USB ID `5656:1201`). The vendor only supports Android;
 this is an independent open-source implementation in Python on top of libusb.
 
-![motherboard](docs/snapshot.png)
+## Example
+
+![Thermal image of a running PC motherboard](docs/example-motherboard.png)
+
+A running PC motherboard, `uti120 snapshot` with the default ironbow palette:
+120×90 sensor pixels upscaled ×4, 8 frames averaged. Warm areas are the chips
+and VRM components; the dark rectangles are cool, reflective parts.
 
 ## Install
 
