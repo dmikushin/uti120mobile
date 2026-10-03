@@ -1,0 +1,3 @@
+# UNI-T UTi120Mobile thermal camera: allow members of the "wheel" group to use it
+# without root (change GROUP to suit your system, e.g. "plugdev" or "video").
+SUBSYSTEM=="usb", ATTRS{idVendor}=="5656", ATTRS{idProduct}=="1201", MODE="0660", GROUP="wheel"

@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uti120"
+version = "0.1.0"
+description = "Linux driver and video tools for the UNI-T UTi120Mobile USB thermal camera"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Dmitry Mikushin", email = "dmitry@kernelgen.org" }]
+requires-python = ">=3.9"
+dependencies = ["pyusb>=1.2", "numpy", "Pillow"]
+
+[project.scripts]
+uti120 = "uti120.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
