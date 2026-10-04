@@ -8,12 +8,22 @@ extern "C" {
 
 namespace uti120 {
 
+// Releases whatever was created, also when the Display constructor throws
+// half-way (the Display destructor does not run then, Impl's does).
 struct Display::Impl {
+  bool sdl_initialized = false;
   SDL_Window* window = nullptr;
   SDL_Renderer* renderer = nullptr;
   SDL_Texture* texture = nullptr;
   std::unique_ptr<Scaler> scaler;
   FramePtr frame;
+
+  ~Impl() {
+    if (texture) SDL_DestroyTexture(texture);
+    if (renderer) SDL_DestroyRenderer(renderer);
+    if (window) SDL_DestroyWindow(window);
+    if (sdl_initialized) SDL_Quit();
+  }
 };
 
 static MediaError sdl_error(const char* what) {
@@ -22,8 +32,9 @@ static MediaError sdl_error(const char* what) {
 
 Display::Display(const std::string& title, int src_w, int src_h, int scale)
     : impl_(std::make_unique<Impl>()) {
-  if (!SDL_Init(SDL_INIT_VIDEO)) throw sdl_error("SDL_Init");
   Impl& m = *impl_;
+  if (!SDL_Init(SDL_INIT_VIDEO)) throw sdl_error("SDL_Init");
+  m.sdl_initialized = true;
   int w = src_w * scale, h = src_h * scale;
   if (!SDL_CreateWindowAndRenderer(title.c_str(), w, h, 0, &m.window, &m.renderer))
     throw sdl_error("creating window");
@@ -36,12 +47,7 @@ Display::Display(const std::string& title, int src_w, int src_h, int scale)
   m.frame = m.scaler->alloc_frame();
 }
 
-Display::~Display() {
-  if (impl_->texture) SDL_DestroyTexture(impl_->texture);
-  if (impl_->renderer) SDL_DestroyRenderer(impl_->renderer);
-  if (impl_->window) SDL_DestroyWindow(impl_->window);
-  SDL_Quit();
-}
+Display::~Display() = default;
 
 void Display::show(const uint8_t* rgb) {
   Impl& m = *impl_;

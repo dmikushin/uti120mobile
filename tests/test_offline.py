@@ -18,7 +18,8 @@ DATA = Path(__file__).parent / "data"
 
 
 def load(name):
-    raw = gzip.open(DATA / name).read()
+    with gzip.open(DATA / name) as f:
+        raw = f.read()
     return [raw[i:i + FRAME_BYTES] for i in range(0, len(raw), FRAME_BYTES)]
 
 

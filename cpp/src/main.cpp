@@ -12,7 +12,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
 #include <exception>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -171,16 +173,25 @@ class Capture {
   explicit Capture(Stream& s) : stream_(s), thread_([this] { run(); }) {}
   ~Capture() { stop(); }
 
-  // Blocks until the first image (or an error) is available.
-  Image newest() {
+  // Blocks until the first image (or an error) is available; nullopt once
+  // stopped or interrupted.  A signal handler cannot notify a condition
+  // variable, so the wait for the first image re-checks the interrupt flag.
+  std::optional<Image> newest() {
     std::unique_lock lock(mutex_);
-    cond_.wait(lock, [&] { return latest_ || error_; });
+    while (!latest_ && !error_) {
+      if (stopping_ || g_interrupted) return std::nullopt;
+      cond_.wait_for(lock, std::chrono::milliseconds(50));
+    }
     if (error_) std::rethrow_exception(error_);
-    return *latest_;
+    return latest_;
   }
 
   void stop() {
-    stopping_ = true;
+    {
+      std::lock_guard lock(mutex_);
+      stopping_ = true;
+    }
+    cond_.notify_all();
     if (thread_.joinable()) thread_.join();
   }
 
@@ -219,11 +230,11 @@ class Session {
  public:
   explicit Session(const Options& o) : cam_(open_usb()) {
     if (!o.raw.empty()) {
-      raw_ = std::fopen(o.raw.c_str(), "wb");
+      raw_.reset(std::fopen(o.raw.c_str(), "wb"));
       if (!raw_) fail("cannot open " + o.raw + ": " + std::strerror(errno));
     }
-    stream_.emplace(cam_, o.dark_frames, o.recalibrate, raw_);
-    stream_->start();
+    stream_.emplace(cam_, o.dark_frames, o.recalibrate, raw_.get());
+    stream_->start();  // on failure returns the camera to idle; members clean up
   }
   ~Session() {
     try {
@@ -231,13 +242,16 @@ class Session {
     } catch (const std::exception& e) {
       LOG_WARNING("uti120", "could not return the camera to idle: %s", e.what());
     }
-    if (raw_ && std::fclose(raw_) != 0) LOG_WARNING("uti120", "error closing raw file");
+    if (raw_ && std::fclose(raw_.release()) != 0) LOG_WARNING("uti120", "error closing raw file");
   }
   Stream& stream() { return *stream_; }
 
  private:
+  struct FileCloser {
+    void operator()(std::FILE* f) const { std::fclose(f); }
+  };
   Camera cam_;
-  std::FILE* raw_ = nullptr;
+  std::unique_ptr<std::FILE, FileCloser> raw_;
   std::optional<Stream> stream_;
 };
 
@@ -281,7 +295,8 @@ int pump(const Options& o, Sink&& sink) {
   long ticks = 0;
   double t0 = monotonic_s();
   while (!g_interrupted && (o.duration == 0 || ticks < o.duration * VIDEO_FPS)) {
-    if (!sink(render(cap.newest().signal).data())) break;
+    std::optional<Image> im = cap.newest();
+    if (!im || !sink(render(im->signal).data())) break;
     ++ticks;
     double delay = t0 + double(ticks) / VIDEO_FPS - monotonic_s();
     if (delay > 0) std::this_thread::sleep_for(std::chrono::duration<double>(delay));

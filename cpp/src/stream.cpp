@@ -58,7 +58,8 @@ void Stream::calibrate() {
   wait_shutter(false);
   calibration_ = Calibration::from_frames(frames);
   calibrated_at_ = monotonic_s();
-  if (log_enabled(Level::Info)) {
+  // Drift between the two halves of the shutter frames needs at least two frames.
+  if (log_enabled(Level::Info) && frames.size() >= 2) {
     size_t half = frames.size() / 2;
     Plane drift = mean_pixels({frames.begin() + half, frames.end()});
     Plane first = mean_pixels({frames.begin(), frames.begin() + half});

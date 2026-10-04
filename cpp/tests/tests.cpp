@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <functional>
 #include <numeric>
@@ -134,6 +135,67 @@ void push_chunks(FakeUsb& usb, const std::vector<uint8_t>& frame) {
 
 std::vector<uint8_t> bytes(std::initializer_list<int> v) {
   return std::vector<uint8_t>(v.begin(), v.end());
+}
+
+std::vector<uint8_t> load_golden(const std::string& name) {
+  std::string path = std::string(TEST_DATA_DIR) + "/golden/" + name + ".gz";
+  gzFile gz = gzopen(path.c_str(), "rb");
+  if (!gz) throw std::runtime_error("cannot open " + path);
+  std::vector<uint8_t> out;
+  uint8_t buf[65536];
+  for (int n; (n = gzread(gz, buf, sizeof buf)) > 0;) out.insert(out.end(), buf, buf + n);
+  gzclose(gz);
+  return out;
+}
+
+template <class T>
+std::vector<T> golden(const std::string& name) {
+  auto raw = load_golden(name);
+  std::vector<T> out(raw.size() / sizeof(T));
+  std::memcpy(out.data(), raw.data(), out.size() * sizeof(T));
+  return out;
+}
+
+// Largest absolute difference; -1 if the sizes differ.
+template <class A, class B>
+double max_diff(const std::vector<A>& a, const std::vector<B>& b) {
+  if (a.size() != b.size()) return -1;
+  double m = 0;
+  for (size_t i = 0; i < a.size(); ++i) m = std::max(m, std::abs(double(a[i]) - double(b[i])));
+  return m;
+}
+
+// The reference outputs in tests/data/golden are written by the Python
+// implementation (tests/make_golden.py); both implementations must agree.
+TEST(test_matches_python_palettes) {
+  for (const char* name : palette::NAMES) {
+    auto lut = palette::lut(name);
+    std::vector<uint8_t> flat(&lut[0][0], &lut[0][0] + 256 * 3);
+    CHECK(max_diff(flat, golden<uint8_t>(std::string("lut_") + name + ".u8")) == 0);
+  }
+}
+
+TEST(test_matches_python_processing) {
+  auto closed = parse_all("closed16.bin.gz"), opened = parse_all("open4.bin.gz");
+  Calibration cal = Calibration::from_frames(closed);
+  CHECK(max_diff(cal.dark(), golden<float>("dark.f32")) == 0);
+  CHECK(max_diff(cal.bad(), golden<uint8_t>("bad.u8")) == 0);
+  AutoGain gain;
+  auto lut = palette::lut("ironbow");
+  for (size_t k = 0; k < opened.size(); ++k) {
+    Plane s = cal.apply(opened[k].pixels());
+    CHECK(max_diff(s, golden<float>("signal" + std::to_string(k) + ".f32")) == 0);
+    auto rgb = palette::colorize(gain(s), lut);
+    CHECK(max_diff(rgb, golden<uint8_t>("ironbow" + std::to_string(k) + ".u8")) == 0);
+  }
+  Frame f = opened[0];
+  uint16_t* px = const_cast<uint16_t*>(f.pixels());
+  for (int y = 30; y < 35; ++y)
+    for (int x = 50; x < 55; ++x) px[y * WIDTH + x] = ADC_MAX;
+  px[0] = 0;
+  Plane s = cal.apply(px);
+  CHECK(max_diff(s, golden<float>("forced.f32")) == 0);
+  CHECK(std::abs(row_stripes(s) - golden<double>("forced_row_stripes.f64")[0]) < 1e-9);
 }
 
 TEST(test_header) {

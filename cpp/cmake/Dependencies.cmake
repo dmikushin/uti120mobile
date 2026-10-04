@@ -98,6 +98,11 @@ ExternalProject_Add(dep_sdl3
              -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
              -DCMAKE_POSITION_INDEPENDENT_CODE=ON
              -DSDL_STATIC=ON -DSDL_SHARED=OFF -DSDL_TEST_LIBRARY=OFF
+             # Every optional dependency (X11, Wayland, libdecor, KMS/DRM,
+             # udev, D-Bus, ...) is dlopen()ed at run time, so the static
+             # archive needs nothing beyond -pthread -lm -ldl at link time
+             # (see deps/lib/pkgconfig/sdl3.pc), whatever the build host has.
+             -DSDL_DEPS_SHARED=ON
              -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF
              -DSDL_AUDIO=OFF -DSDL_JOYSTICK=OFF -DSDL_HAPTIC=OFF -DSDL_HIDAPI=OFF
              -DSDL_SENSOR=OFF -DSDL_CAMERA=OFF -DSDL_POWER=OFF

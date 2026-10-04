@@ -78,13 +78,16 @@ class Stream:
         self._wait_shutter(False)
         self.calibration = Calibration.from_frames(frames)
         self.calibrated_at = time.monotonic()
-        half = len(frames) // 2
-        drift = (np.mean([f.pixels for f in frames[half:]], axis=0)
-                 - np.mean([f.pixels for f in frames[:half]], axis=0))
-        log.info("calibrated on %d shutter frames, %d bad pixels, fpa %.2fC, "
-                 "row stripes: dark drift %.1f, first open frame %.1f",
-                 len(frames), int(self.calibration.bad.sum()), frames[-1].fpa_temp,
-                 row_stripes(drift), row_stripes(self.calibration.apply(self._grab().pixels)))
+        # Drift between the two halves of the shutter frames needs at least two frames.
+        if log.isEnabledFor(logging.INFO) and len(frames) >= 2:
+            half = len(frames) // 2
+            drift = (np.mean([f.pixels for f in frames[half:]], axis=0)
+                     - np.mean([f.pixels for f in frames[:half]], axis=0))
+            log.info("calibrated on %d shutter frames, %d bad pixels, fpa %.2fC, "
+                     "row stripes: dark drift %.1f, first open frame %.1f",
+                     len(frames), int(self.calibration.bad.sum()), frames[-1].fpa_temp,
+                     row_stripes(drift),
+                     row_stripes(self.calibration.apply(self._grab().pixels)))
 
     def read(self) -> Image:
         if self.recalibrate_s and time.monotonic() - self.calibrated_at > self.recalibrate_s:
