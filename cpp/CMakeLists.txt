@@ -1,3 +1,6 @@
+# Desktop superbuild: third-party libraries (cmake/Dependencies.cmake), the
+# backend (core/) and the command-line frontend (desktop/), linked into one
+# static executable.
 cmake_minimum_required(VERSION 3.20)
 project(uti120 VERSION 0.1.0 LANGUAGES C CXX)
 
@@ -9,23 +12,17 @@ endif()
 
 include(cmake/Dependencies.cmake)
 
-add_library(uti120core STATIC
-  src/frame.cpp
-  src/device.cpp
-  src/process.cpp
-  src/palette.cpp
-  src/stream.cpp
-  src/log.cpp)
-target_include_directories(uti120core PUBLIC src)
-target_compile_options(uti120core PRIVATE -Wall -Wextra)
-target_link_libraries(uti120core PUBLIC deps::usb deps::z Threads::Threads)
+enable_testing()
+set(UTI120_LIBUSB_TARGET deps::usb)
+set(UTI120_ZLIB_TARGET deps::z)
+add_subdirectory(core)
 
 add_executable(uti120
-  src/main.cpp
-  src/scaler.cpp
-  src/video.cpp
-  src/png.cpp
-  src/display.cpp)
+  desktop/main.cpp
+  desktop/scaler.cpp
+  desktop/video.cpp
+  desktop/png.cpp
+  desktop/display.cpp)
 target_compile_options(uti120 PRIVATE -Wall -Wextra)
 target_compile_definitions(uti120 PRIVATE UTI120_VERSION="${PROJECT_VERSION}")
 # Everything but the C/C++ runtime is linked statically.
@@ -33,11 +30,3 @@ target_link_options(uti120 PRIVATE -static-libstdc++ -static-libgcc)
 target_link_libraries(uti120 PRIVATE uti120core deps::avformat deps::avcodec
                       deps::swscale deps::avutil deps::sdl3)
 install(TARGETS uti120)
-
-enable_testing()
-add_executable(uti120_tests tests/tests.cpp)
-target_compile_options(uti120_tests PRIVATE -Wall -Wextra)
-target_compile_definitions(uti120_tests PRIVATE
-  TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../tests/data")
-target_link_libraries(uti120_tests PRIVATE uti120core)
-add_test(NAME uti120_tests COMMAND uti120_tests)

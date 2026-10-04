@@ -1,10 +1,10 @@
-#include "device.hpp"
+#include "uti120/device.hpp"
 
 #include <libusb.h>
 
 #include <cstdio>
 
-#include "log.hpp"
+#include "uti120/log.hpp"
 
 namespace uti120 {
 
@@ -24,6 +24,7 @@ namespace {
 
 class LibusbTransport final : public Transport {
  public:
+  // Finds the camera by VID:PID.
   LibusbTransport() {
     if (int rc = libusb_init_context(&ctx_, nullptr, 0); rc != 0)
       throw DeviceError(std::string("libusb_init: ") + libusb_error_name(rc));
@@ -34,6 +35,23 @@ class LibusbTransport final : public Transport {
       std::snprintf(msg, sizeof msg, "no USB device %04x:%04x found (or no permission)", VID, PID);
       throw DeviceError(msg);
     }
+    claim();
+  }
+
+  // Uses an already opened usbfs file descriptor (Android: UsbDeviceConnection).
+  // Device discovery is disabled: an app may not scan /dev/bus/usb.
+  explicit LibusbTransport(int fd) {
+    libusb_init_option opt{LIBUSB_OPTION_NO_DEVICE_DISCOVERY, {0}};
+    if (int rc = libusb_init_context(&ctx_, &opt, 1); rc != 0)
+      throw DeviceError(std::string("libusb_init: ") + libusb_error_name(rc));
+    if (int rc = libusb_wrap_sys_device(ctx_, intptr_t(fd), &handle_); rc != 0) {
+      libusb_exit(ctx_);
+      throw DeviceError(std::string("libusb_wrap_sys_device: ") + libusb_error_name(rc));
+    }
+    claim();
+  }
+
+  void claim() {
     // Deliberately no libusb_set_configuration(): the device enumerates already
     // configured, and re-selecting the configuration resets the host-side data
     // toggles only, after which the command endpoint stops answering.
@@ -94,6 +112,8 @@ uint32_t load_be32(const uint8_t* p) {
 }  // namespace
 
 std::unique_ptr<Transport> open_usb() { return std::make_unique<LibusbTransport>(); }
+
+std::unique_ptr<Transport> open_usb_fd(int fd) { return std::make_unique<LibusbTransport>(fd); }
 
 Camera::Camera(std::unique_ptr<Transport> transport) : transport_(std::move(transport)) {}
 

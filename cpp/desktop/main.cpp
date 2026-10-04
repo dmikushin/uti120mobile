@@ -1,32 +1,28 @@
 // uti120 {info,snapshot,record,live}: one process from USB to MP4/PNG/window.
 //
-// Threads: a capture thread reads and calibrates camera frames as fast as the
-// camera delivers them and keeps only the newest image; the main thread
-// renders that image at a constant 25 Hz into the encoder or the window, so a
-// slow consumer never delays frame requests and the video duration always
-// equals the wall-clock duration.
+// The backend's capture thread (uti120::Pipeline) reads and calibrates camera
+// frames as fast as the camera delivers them and keeps only the newest image;
+// the main thread renders that image at a constant 25 Hz into the encoder or
+// the window, so a slow consumer never delays frame requests and the video
+// duration always equals the wall-clock duration.
 
 #include <atomic>
-#include <condition_variable>
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <chrono>
-#include <exception>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
 #include <vector>
 
-#include "device.hpp"
-#include "log.hpp"
 #include "media.hpp"
-#include "palette.hpp"
-#include "process.hpp"
-#include "stream.hpp"
+#include "uti120/device.hpp"
+#include "uti120/log.hpp"
+#include "uti120/palette.hpp"
+#include "uti120/pipeline.hpp"
 
 extern "C" {
 #include <libavutil/log.h>
@@ -146,114 +142,28 @@ Options parse_args(int argc, char** argv) {
   return o;
 }
 
-// Signal -> RGB24 at sensor resolution.
-class Renderer {
- public:
-  explicit Renderer(const Options& o) : opt_(o), lut_(palette::lut(o.palette)) {}
-
-  std::vector<uint8_t> operator()(const Plane& signal) {
-    Plane img(PIXELS);
-    for (int y = 0; y < HEIGHT; ++y)
-      for (int x = 0; x < WIDTH; ++x) {
-        int sy = opt_.flip ? HEIGHT - 1 - y : y, sx = opt_.mirror ? WIDTH - 1 - x : x;
-        img[y * WIDTH + x] = signal[sy * WIDTH + sx];
-      }
-    return palette::colorize(gain_(img), lut_);
-  }
-
- private:
-  const Options& opt_;
-  palette::Lut lut_;
-  AutoGain gain_;
+// The raw frame file, when requested, outlives the pipeline that writes it.
+struct FileCloser {
+  void operator()(std::FILE* f) const { std::fclose(f); }
 };
+using File = std::unique_ptr<std::FILE, FileCloser>;
 
-// Reads the camera continuously and keeps only the newest image.
-class Capture {
- public:
-  explicit Capture(Stream& s) : stream_(s), thread_([this] { run(); }) {}
-  ~Capture() { stop(); }
+File open_raw(const Options& o) {
+  if (o.raw.empty()) return nullptr;
+  File f(std::fopen(o.raw.c_str(), "wb"));
+  if (!f) fail("cannot open " + o.raw + ": " + std::strerror(errno));
+  return f;
+}
 
-  // Blocks until the first image (or an error) is available; nullopt once
-  // stopped or interrupted.  A signal handler cannot notify a condition
-  // variable, so the wait for the first image re-checks the interrupt flag.
-  std::optional<Image> newest() {
-    std::unique_lock lock(mutex_);
-    while (!latest_ && !error_) {
-      if (stopping_ || g_interrupted) return std::nullopt;
-      cond_.wait_for(lock, std::chrono::milliseconds(50));
-    }
-    if (error_) std::rethrow_exception(error_);
-    return latest_;
-  }
-
-  void stop() {
-    {
-      std::lock_guard lock(mutex_);
-      stopping_ = true;
-    }
-    cond_.notify_all();
-    if (thread_.joinable()) thread_.join();
-  }
-
-  long count() const { return count_; }
-
- private:
-  void run() {
-    try {
-      while (!stopping_) {
-        Image im = stream_.read();
-        std::lock_guard lock(mutex_);
-        latest_ = std::move(im);
-        ++count_;
-        cond_.notify_all();
-      }
-    } catch (...) {
-      std::lock_guard lock(mutex_);
-      error_ = std::current_exception();
-      cond_.notify_all();
-    }
-  }
-
-  Stream& stream_;
-  std::mutex mutex_;
-  std::condition_variable cond_;
-  std::optional<Image> latest_;
-  std::exception_ptr error_;
-  std::atomic<long> count_{0};
-  std::atomic<bool> stopping_{false};
-  std::thread thread_;
-};
-
-// Camera started and calibrated for the lifetime of the object; returned to
-// idle on destruction.
-class Session {
- public:
-  explicit Session(const Options& o) : cam_(open_usb()) {
-    if (!o.raw.empty()) {
-      raw_.reset(std::fopen(o.raw.c_str(), "wb"));
-      if (!raw_) fail("cannot open " + o.raw + ": " + std::strerror(errno));
-    }
-    stream_.emplace(cam_, o.dark_frames, o.recalibrate, raw_.get());
-    stream_->start();  // on failure returns the camera to idle; members clean up
-  }
-  ~Session() {
-    try {
-      stream_->stop();
-    } catch (const std::exception& e) {
-      LOG_WARNING("uti120", "could not return the camera to idle: %s", e.what());
-    }
-    if (raw_ && std::fclose(raw_.release()) != 0) LOG_WARNING("uti120", "error closing raw file");
-  }
-  Stream& stream() { return *stream_; }
-
- private:
-  struct FileCloser {
-    void operator()(std::FILE* f) const { std::fclose(f); }
-  };
-  Camera cam_;
-  std::unique_ptr<std::FILE, FileCloser> raw_;
-  std::optional<Stream> stream_;
-};
+std::unique_ptr<Pipeline> start_pipeline(const Options& o, std::FILE* raw) {
+  View view;
+  view.palette = o.palette;
+  view.mirror = o.mirror;
+  view.flip = o.flip;
+  auto p = std::make_unique<Pipeline>(open_usb(), Settings{o.dark_frames, o.recalibrate, raw}, view);
+  p->start();
+  return p;
+}
 
 int cmd_info() {
   Camera cam(open_usb());
@@ -265,64 +175,78 @@ int cmd_info() {
 }
 
 int cmd_snapshot(const Options& o) {
-  Plane sum(PIXELS, 0.0f);
-  std::optional<Frame> last;
+  Frame last;
+  Plane mean;
+  RgbImage img;
   {
-    Session s(o);
-    for (int k = 0; k < o.average; ++k) {
-      Image im = s.stream().read();
-      for (int i = 0; i < PIXELS; ++i) sum[i] += im.signal[i];
-      last = im.frame;
-    }
+    auto p = start_pipeline(o, nullptr);
+    mean = p->snapshot(o.average, &last);
+    img = p->render(mean);
   }
-  for (float& v : sum) v /= float(o.average);
-  Renderer render(o);
-  write_png(o.output, render(sum).data(), WIDTH, HEIGHT, o.scale);
-  if (!o.npy.empty()) write_npy(o.npy, sum, HEIGHT, WIDTH);
-  std::vector<double> v(sum.begin(), sum.end());
+  write_png(o.output, img.rgb.data(), img.width, img.height, o.scale);
+  if (!o.npy.empty()) write_npy(o.npy, mean, HEIGHT, WIDTH);
+  std::vector<double> v(mean.begin(), mean.end());
   std::printf("%s: %s, signal p1/p50/p99 = [%.1f, %.1f, %.1f]\n", o.output.c_str(),
-              last->describe().c_str(), percentile(v, 1), percentile(v, 50), percentile(v, 99));
+              last.describe().c_str(), percentile(v, 1), percentile(v, 50), percentile(v, 99));
   return 0;
 }
 
-// Feeds the newest image to `sink` VIDEO_FPS times a second.  The sink returns
-// false to stop (window closed).
-template <class Sink>
-int pump(const Options& o, Sink&& sink) {
-  Session session(o);
-  Capture cap(session.stream());
-  Renderer render(o);
-  long ticks = 0;
-  double t0 = monotonic_s();
-  while (!g_interrupted && (o.duration == 0 || ticks < o.duration * VIDEO_FPS)) {
-    std::optional<Image> im = cap.newest();
-    if (!im || !sink(render(im->signal).data())) break;
-    ++ticks;
-    double delay = t0 + double(ticks) / VIDEO_FPS - monotonic_s();
-    if (delay > 0) std::this_thread::sleep_for(std::chrono::duration<double>(delay));
+// Feeds the newest image to `sink` VIDEO_FPS times a second.  The sink is
+// created from the size of the rendered image and returns false to stop
+// (window closed).
+template <class MakeSink>
+int pump(const Options& o, MakeSink&& make_sink) {
+  File raw = open_raw(o);
+  long ticks = 0, captured = 0;
+  double t0 = 0, dt = 0;
+  {
+    auto p = start_pipeline(o, raw.get());
+    std::optional<Image> im;
+    while (!g_interrupted && !(im = p->newest(std::chrono::milliseconds(50)))) {
+    }
+    if (im) {
+      RgbImage first = p->render(im->signal);
+      auto sink = make_sink(first.width, first.height);
+      t0 = monotonic_s();
+      while (!g_interrupted && (o.duration == 0 || ticks < o.duration * VIDEO_FPS)) {
+        im = p->newest(std::chrono::milliseconds(50));
+        if (!im) continue;
+        if (!sink(p->render(im->signal).rgb.data())) break;
+        ++ticks;
+        double delay = t0 + double(ticks) / VIDEO_FPS - monotonic_s();
+        if (delay > 0) std::this_thread::sleep_for(std::chrono::duration<double>(delay));
+      }
+      dt = monotonic_s() - t0;
+    }
+    captured = p->frames_captured();
   }
-  cap.stop();
-  double dt = monotonic_s() - t0;
+  if (raw && std::fclose(raw.release()) != 0) fail("error writing " + o.raw);
   std::printf("%ld video frames in %.1f s from %ld camera frames (%.1f fps)\n", ticks, dt,
-              cap.count(), double(cap.count()) / dt);
+              captured, dt > 0 ? double(captured) / dt : 0.0);
   return 0;
 }
 
 int cmd_record(const Options& o) {
-  VideoWriter video(o.output, WIDTH, HEIGHT, o.scale, VIDEO_FPS);
-  int rc = pump(o, [&](const uint8_t* rgb) {
-    video.write(rgb);
-    return true;
+  std::unique_ptr<VideoWriter> video;
+  int rc = pump(o, [&](int w, int h) {
+    video = std::make_unique<VideoWriter>(o.output, w, h, o.scale, VIDEO_FPS);
+    return [&](const uint8_t* rgb) {
+      video->write(rgb);
+      return true;
+    };
   });
-  video.finish();
+  if (video) video->finish();
   return rc;
 }
 
 int cmd_live(const Options& o) {
-  Display display("UTi120Mobile", WIDTH, HEIGHT, o.scale);
-  return pump(o, [&](const uint8_t* rgb) {
-    display.show(rgb);
-    return display.poll();
+  std::unique_ptr<Display> display;
+  return pump(o, [&](int w, int h) {
+    display = std::make_unique<Display>("UTi120Mobile", w, h, o.scale);
+    return [&](const uint8_t* rgb) {
+      display->show(rgb);
+      return display->poll();
+    };
   });
 }
 

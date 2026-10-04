@@ -13,9 +13,10 @@
 #include <string>
 #include <vector>
 
-#include "device.hpp"
-#include "palette.hpp"
-#include "process.hpp"
+#include "uti120/device.hpp"
+#include "uti120/pipeline.hpp"
+#include "uti120/palette.hpp"
+#include "uti120/process.hpp"
 
 using namespace uti120;
 
@@ -196,6 +197,34 @@ TEST(test_matches_python_processing) {
   Plane s = cal.apply(px);
   CHECK(max_diff(s, golden<float>("forced.f32")) == 0);
   CHECK(std::abs(row_stripes(s) - golden<double>("forced_row_stripes.f64")[0]) < 1e-9);
+}
+
+// Rotating the rendered image back by hand must give the unrotated rendering,
+// and 180 degrees must equal mirror + flip.
+TEST(test_renderer_orientation) {
+  auto opened = parse_all("open4.bin.gz");
+  Calibration cal = Calibration::from_frames(parse_all("closed16.bin.gz"));
+  Plane s = cal.apply(opened[0].pixels());
+  auto render = [&](View v) { return Renderer(v)(s); };
+  RgbImage base = render({});
+  CHECK(base.width == WIDTH && base.height == HEIGHT);
+  for (int rot : {90, 180, 270}) {
+    RgbImage r = render({"ironbow", false, false, rot});
+    bool swap = rot != 180;
+    CHECK(r.width == (swap ? HEIGHT : WIDTH) && r.height == (swap ? WIDTH : HEIGHT));
+    bool same = true;
+    for (int y = 0; y < HEIGHT; ++y)
+      for (int x = 0; x < WIDTH; ++x) {
+        // Where the clockwise rotation puts sensor pixel (x, y).
+        int rx = rot == 90 ? HEIGHT - 1 - y : rot == 180 ? WIDTH - 1 - x : y;
+        int ry = rot == 90 ? x : rot == 180 ? HEIGHT - 1 - y : WIDTH - 1 - x;
+        for (int c = 0; c < 3; ++c)
+          same &= r.rgb[3 * (ry * r.width + rx) + c] == base.rgb[3 * (y * WIDTH + x) + c];
+      }
+    CHECK(same);
+  }
+  CHECK(render({"ironbow", true, true, 0}).rgb == render({"ironbow", false, false, 180}).rgb);
+  CHECK(throws<std::invalid_argument>([&] { render({"ironbow", false, false, 45}); }, "rotation"));
 }
 
 TEST(test_header) {

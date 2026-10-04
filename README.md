@@ -39,6 +39,10 @@ building, or the corresponding SDL3 backend is left out).
 
 `ctest --test-dir cpp/build` runs the offline tests.
 
+The C++ code is split into the backend `cpp/core` (protocol, calibration,
+processing, rendering; a static library with no media dependencies) and the
+desktop frontend `cpp/desktop` (command line, FFmpeg/x264 encoding, SDL3 window).
+
 ### Python
 
 ```sh

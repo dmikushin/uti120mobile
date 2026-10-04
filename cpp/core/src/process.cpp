@@ -1,4 +1,4 @@
-#include "process.hpp"
+#include "uti120/process.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -17,12 +17,15 @@ double median(std::vector<double> v) {
 }
 
 double percentile(std::vector<double> v, double p) {
-  std::sort(v.begin(), v.end());
+  // Linear interpolation between the order statistics at floor(pos) and
+  // floor(pos) + 1, found by selection rather than a full sort.
   double pos = p / 100.0 * double(v.size() - 1);
   size_t i = size_t(std::floor(pos));
-  if (i + 1 >= v.size()) return v.back();
-  double frac = pos - double(i);
-  return v[i] + frac * (v[i + 1] - v[i]);
+  std::nth_element(v.begin(), v.begin() + i, v.end());
+  double lo = v[i];
+  if (i + 1 >= v.size()) return lo;
+  double hi = *std::min_element(v.begin() + i + 1, v.end());
+  return lo + (pos - double(i)) * (hi - lo);
 }
 
 Calibration::Calibration(Plane dark) : dark_(std::move(dark)), bad_(find_bad_pixels(dark_)) {}
@@ -119,7 +122,6 @@ double row_stripes(const Plane& img) {
 
 std::vector<float> AutoGain::operator()(const Plane& img) {
   std::vector<double> v(img.begin(), img.end());
-  std::sort(v.begin(), v.end());
   double lo = percentile(v, low_), hi = percentile(v, high_);
   if (!range_) {
     range_ = {lo, hi};

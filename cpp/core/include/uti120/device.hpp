@@ -22,7 +22,7 @@
 #include <string>
 #include <vector>
 
-#include "frame.hpp"
+#include "uti120/frame.hpp"
 
 namespace uti120 {
 
@@ -80,6 +80,9 @@ class Transport {
 
 // Opens the first 5656:1201 device and claims both interfaces.
 std::unique_ptr<Transport> open_usb();
+// Same for a device already opened by the platform (Android's
+// UsbDeviceConnection.getFileDescriptor()); the descriptor stays owned by the caller.
+std::unique_ptr<Transport> open_usb_fd(int fd);
 
 struct DeviceInfo {
   std::string firmware, hardware, sensor;
