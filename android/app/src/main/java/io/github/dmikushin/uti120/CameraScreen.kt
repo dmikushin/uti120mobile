@@ -3,6 +3,16 @@ package io.github.dmikushin.uti120
 import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.provider.MediaStore
+import android.os.SystemClock
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import kotlinx.coroutines.delay
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -66,6 +76,7 @@ private val BarColor = Color(0xFF0E0E0E)      // gray_deep: header and bottom ba
 private val ContentColor = Color(0xFF050316)  // black: behind the image
 private val PanelColor = Color(0xFF202020)    // panel under the image
 private val Muted = Color(0xFF8E898C)         // gray
+private val RecColor = Color(0xFFFF3B30)
 
 private enum class Tab { Palettes, Settings }
 
@@ -111,7 +122,6 @@ private fun Header(c: CameraController, toggleDiagnostics: () -> Unit) {
         Text("UTi120Mobile", color = Color.White, fontWeight = FontWeight.Medium, fontSize = 17.sp)
         Spacer(Modifier.weight(1f))
         val status = when {
-            c.recording -> "● REC"
             c.calibrating -> "Calibrating…"
             c.phase == Phase.Live -> "%.0f fps".format(c.fps)
             c.phase == Phase.Starting -> "Calibrating…"
@@ -119,7 +129,7 @@ private fun Header(c: CameraController, toggleDiagnostics: () -> Unit) {
         }
         // Tapping the frame rate shows where the time of each camera frame goes.
         Text(
-            status, color = if (c.recording) Color(0xFFFF4040) else Muted, fontSize = 14.sp,
+            status, color = Muted, fontSize = 14.sp,
             modifier = Modifier.clickable(enabled = c.phase == Phase.Live, onClick = toggleDiagnostics).padding(8.dp),
         )
     }
@@ -234,43 +244,74 @@ private fun CapturePanel(c: CameraController, modifier: Modifier) {
     }
 }
 
-/** One button of two halves: the left takes a photo, the right starts and stops recording. */
+/**
+ * The capture button: a tap takes a photo; pressing and holding records video
+ * until the finger is lifted (the ring turns red and a timer runs above it).
+ */
 @Composable
 private fun CaptureButton(c: CameraController, modifier: Modifier) {
     val live = c.phase == Phase.Live
-    val shape = RoundedCornerShape(36.dp)
-    Row(modifier.width(220.dp).height(72.dp).clip(shape).border(3.dp, Color.White, shape)) {
-        CaptureHalf(
-            label = "Photo", enabled = live && !c.photoBusy, busy = c.photoBusy,
-            background = Color.White, onClick = c::takePhoto, modifier = Modifier.weight(1f),
+    val haptics = LocalHapticFeedback.current
+    val active = c.recording || c.videoBusy
+    val ring = if (active) RecColor else Color.White
+    Column(modifier, horizontalAlignment = Alignment.CenterHorizontally) {
+        Box(Modifier.height(28.dp)) { if (c.recording) RecordingTimer(c.recordingSince) }
+        Spacer(Modifier.height(6.dp))
+        Box(
+            Modifier.size(84.dp).clip(CircleShape).border(5.dp, if (live) ring else Color(0xFF808080), CircleShape)
+                .semantics { contentDescription = "Capture: tap for a photo, press and hold for video" }
+                .pointerInput(live) {
+                    if (!live) return@pointerInput
+                    var holding = false
+                    detectTapGestures(
+                        onTap = { c.takePhoto() },
+                        onLongPress = {
+                            holding = true
+                            haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                            c.startRecording()
+                        },
+                        onPress = {
+                            tryAwaitRelease()  // released or cancelled
+                            if (holding) {
+                                holding = false
+                                c.stopRecording()
+                            }
+                        },
+                    )
+                }
+                .padding(9.dp).clip(CircleShape)
+                .background(if (!live) Color(0xFF808080) else if (active) RecColor else Color.White),
+            contentAlignment = Alignment.Center,
         ) {
-            Icon(Icons.Filled.PhotoCamera, "Take photo", tint = Color.Black, modifier = Modifier.size(28.dp))
+            when {
+                c.photoBusy -> CircularProgressIndicator(Modifier.size(30.dp), color = Color.Black, strokeWidth = 3.dp)
+                active -> Box(Modifier.size(22.dp).clip(RoundedCornerShape(5.dp)).background(Color.White))
+            }
         }
-        Box(Modifier.width(3.dp).fillMaxHeight().background(PanelColor))
-        CaptureHalf(
-            label = if (c.recording) "Stop" else "Video", enabled = live && !c.videoBusy, busy = c.videoBusy,
-            background = if (c.recording) Color(0xFFE02020) else Color.White,
-            onClick = c::toggleRecording, modifier = Modifier.weight(1f),
-        ) {
-            if (c.recording) Icon(Icons.Filled.Stop, "Stop recording", tint = Color.White, modifier = Modifier.size(30.dp))
-            else Icon(Icons.Filled.FiberManualRecord, "Start recording", tint = Color(0xFFE02020), modifier = Modifier.size(30.dp))
-        }
+        Text(
+            if (active) "Release to stop" else "Tap: photo · Hold: video",
+            color = Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp),
+        )
     }
 }
 
 @Composable
-private fun CaptureHalf(
-    label: String, enabled: Boolean, busy: Boolean, background: Color, onClick: () -> Unit,
-    modifier: Modifier, icon: @Composable () -> Unit,
-) {
-    val content = if (background == Color.White) Color.Black else Color.White
-    Column(
-        modifier.fillMaxHeight().background(if (enabled || busy) background else Color(0xFF808080))
-            .clickable(enabled = enabled, onClick = onClick),
-        horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center,
+private fun RecordingTimer(since: Long) {
+    var now by remember { mutableLongStateOf(SystemClock.elapsedRealtime()) }
+    LaunchedEffect(since) {
+        while (true) {
+            now = SystemClock.elapsedRealtime()
+            delay(250)
+        }
+    }
+    val seconds = ((now - since) / 1000).coerceAtLeast(0)
+    Row(
+        Modifier.background(Color(0xCC000000), RoundedCornerShape(12.dp)).padding(horizontal = 10.dp, vertical = 3.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        if (busy) CircularProgressIndicator(Modifier.size(28.dp), color = content, strokeWidth = 3.dp) else icon()
-        Text(label, color = content, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+        Box(Modifier.size(8.dp).clip(CircleShape).background(RecColor))
+        Spacer(Modifier.width(6.dp))
+        Text("%02d:%02d".format(seconds / 60, seconds % 60), color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Medium)
     }
 }
 

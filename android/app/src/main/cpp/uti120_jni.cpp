@@ -14,6 +14,7 @@
 #include "uti120/log.hpp"
 #include "uti120/palette.hpp"
 #include "uti120/pipeline.hpp"
+#include "uti120/replay.hpp"
 
 using namespace uti120;
 
@@ -78,14 +79,17 @@ bool copy_into(JNIEnv* env, jobject bitmap, const RgbImage& img) {
 
 extern "C" {
 
+// The camera is the USB device behind `fd` or, if `replay` is not null, the
+// raw frames recorded in that file (for testing without the device).
 JNIEXPORT jlong JNICALL Java_io_github_dmikushin_uti120_NativeCamera_nativeOpen(
-    JNIEnv* env, jclass, jint fd, jint dark_frames, jdouble recalibrate_s, jstring palette,
-    jboolean mirror, jboolean flip, jint rotation) {
+    JNIEnv* env, jclass, jint fd, jstring replay, jint dark_frames, jdouble recalibrate_s,
+    jstring palette, jboolean mirror, jboolean flip, jint rotation) {
   return guarded(env, [&]() -> jlong {
     // Start-up and calibration messages are rare and useful in logcat.
     set_log_level(Level::Info);
     View view{to_string(env, palette), bool(mirror), bool(flip), int(rotation)};
-    auto p = std::make_unique<Pipeline>(open_usb_fd(fd),
+    auto transport = replay ? open_replay(to_string(env, replay)) : open_usb_fd(fd);
+    auto p = std::make_unique<Pipeline>(std::move(transport),
                                         Settings{int(dark_frames), double(recalibrate_s), nullptr},
                                         view);
     return reinterpret_cast<jlong>(p.release());

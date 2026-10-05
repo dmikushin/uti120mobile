@@ -16,6 +16,8 @@ import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableDoubleStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.ImageBitmap
@@ -39,7 +41,7 @@ class CameraController(private val context: Context) {
         private set
     var image by mutableStateOf<ImageBitmap?>(null)
         private set
-    var fps by mutableStateOf(0.0)
+    var fps by mutableDoubleStateOf(0.0)
         private set
     /** Frame timing of the last second, shown when the fps label is tapped. */
     var diagnostics by mutableStateOf("")
@@ -48,12 +50,18 @@ class CameraController(private val context: Context) {
         private set
     var recording by mutableStateOf(false)
         private set
+    /** SystemClock.elapsedRealtime() when the current recording started. */
+    var recordingSince by mutableLongStateOf(0L)
+        private set
     /** A photo is being taken (8 frames averaged and saved). */
     var photoBusy by mutableStateOf(false)
         private set
-    /** A recording is being started or finished. */
+    /** A recording is being started. */
     var videoBusy by mutableStateOf(false)
         private set
+
+    /** Debug builds: play back this raw recording instead of using the USB camera. */
+    var replay: String? = null
     var lastCapture by mutableStateOf<Uri?>(null)
         private set
     var view by mutableStateOf(Prefs.loadView(context))
@@ -107,6 +115,10 @@ class CameraController(private val context: Context) {
     /** Finds the camera, asks for permission if needed, then opens and calibrates it. */
     fun connect() {
         if (phase == Phase.Starting || phase == Phase.Live) return
+        replay?.let { path ->
+            start { NativeCamera(path, it.first, it.second) }
+            return
+        }
         val device = usb.deviceList.values.firstOrNull(::isCamera)
         if (device == null) {
             setPhase(Phase.NoCamera, "")
@@ -118,15 +130,21 @@ class CameraController(private val context: Context) {
             usb.requestPermission(device, PendingIntent.getBroadcast(context, 0, intent, PendingIntent.FLAG_MUTABLE))
             return
         }
+        start {
+            val conn = usb.openDevice(device) ?: error("cannot open the USB device")
+            connection = conn
+            NativeCamera(conn.fileDescriptor, it.first, it.second)
+        }
+    }
+
+    /** Opens the camera with [open] on the worker, calibrates it and starts rendering. */
+    private fun start(open: (Pair<CameraSettings, ViewSettings>) -> NativeCamera) {
         setPhase(Phase.Starting, "")
         val id = ++session
-        val s = settings
-        val v = view
+        val sv = settings to view
         worker.execute {
             try {
-                val conn = usb.openDevice(device) ?: error("cannot open the USB device")
-                connection = conn
-                val cam = NativeCamera(conn.fileDescriptor, s, v)
+                val cam = open(sv)
                 camera = cam
                 cam.start()
                 startRendering(cam, id)
@@ -194,34 +212,46 @@ class CameraController(private val context: Context) {
         }
     }
 
-    fun toggleRecording() {
-        if (phase != Phase.Live || videoBusy) return
+    /** Starts recording (press and hold on the capture button). */
+    fun startRecording() {
+        if (phase != Phase.Live || recording || videoBusy) return
         videoBusy = true
         worker.execute {
             val result = runCatching {
-                val active = synchronized(recorderLock) { recorder }
-                if (active == null) {
-                    val uri = Captures.newVideo(context.contentResolver)
-                    videoUri = uri
-                    try {
-                        val (w, h) = camera!!.imageSize()
-                        val fd = context.contentResolver.openFileDescriptor(uri, "rw") ?: error("cannot open $uri")
-                        val created = VideoRecorder(fd, w, h)  // closes fd itself if it fails
-                        synchronized(recorderLock) { recorder = created }
-                    } catch (e: Exception) {
-                        Captures.discard(context.contentResolver, uri)
-                        videoUri = null
-                        throw e
-                    }
-                    null
-                } else {
-                    finishRecording(active)
+                check(synchronized(recorderLock) { recorder } == null) { "already recording" }
+                val uri = Captures.newVideo(context.contentResolver)
+                videoUri = uri
+                try {
+                    val (w, h) = camera!!.imageSize()
+                    val fd = context.contentResolver.openFileDescriptor(uri, "rw") ?: error("cannot open $uri")
+                    val created = VideoRecorder(fd, w, h)  // closes fd itself if it fails
+                    synchronized(recorderLock) { recorder = created }
+                } catch (e: Exception) {
+                    Captures.discard(context.contentResolver, uri)
+                    videoUri = null
+                    throw e
                 }
             }
-            val nowRecording = synchronized(recorderLock) { recorder != null }
             main.post {
                 videoBusy = false
-                recording = nowRecording
+                result.onSuccess {
+                    recording = true
+                    recordingSince = SystemClock.elapsedRealtime()
+                }.onFailure { show("Video failed: ${it.message}") }
+            }
+        }
+    }
+
+    /**
+     * Stops recording (the capture button is released).  Queued behind a
+     * start that is still in progress, so a short hold still ends the video.
+     */
+    fun stopRecording() {
+        worker.execute {
+            val active = synchronized(recorderLock) { recorder } ?: return@execute
+            val result = runCatching { finishRecording(active) }
+            main.post {
+                recording = false
                 result.onSuccess { uri -> uri?.let { lastCapture = it; show("Video saved to Movies/UTi120") } }
                     .onFailure { show("Video failed: ${it.message}") }
             }

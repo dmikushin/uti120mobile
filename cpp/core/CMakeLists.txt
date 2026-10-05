@@ -17,6 +17,7 @@ add_library(uti120core STATIC
   src/palette.cpp
   src/stream.cpp
   src/pipeline.cpp
+  src/replay.cpp
   src/log.cpp)
 target_compile_features(uti120core PUBLIC cxx_std_20)
 target_include_directories(uti120core PUBLIC include)

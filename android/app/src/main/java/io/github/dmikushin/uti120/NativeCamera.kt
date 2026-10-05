@@ -50,9 +50,17 @@ data class CameraSettings(
  * seconds (on-camera NUC and shutter calibration) and must not run on the UI
  * thread.  Native failures arrive as RuntimeException with the backend's message.
  */
-class NativeCamera(fd: Int, settings: CameraSettings, view: ViewSettings) : AutoCloseable {
+class NativeCamera private constructor(
+    fd: Int, replay: String?, settings: CameraSettings, view: ViewSettings,
+) : AutoCloseable {
+    /** The camera behind a USB file descriptor (UsbDeviceConnection.getFileDescriptor()). */
+    constructor(fd: Int, settings: CameraSettings, view: ViewSettings) : this(fd, null, settings, view)
+
+    /** Raw frames recorded from a camera, played back at 25 fps (debug builds, testing). */
+    constructor(replay: String, settings: CameraSettings, view: ViewSettings) : this(-1, replay, settings, view)
+
     @Volatile private var handle: Long = nativeOpen(
-        fd, settings.darkFrames, settings.recalibrateSeconds.toDouble(),
+        fd, replay, settings.darkFrames, settings.recalibrateSeconds.toDouble(),
         view.palette, view.mirror, view.flip, view.rotation,
     )
 
@@ -98,7 +106,7 @@ class NativeCamera(fd: Int, settings: CameraSettings, view: ViewSettings) : Auto
         fun paletteColors(name: String): IntArray = nativePaletteColors(name)
 
         @JvmStatic private external fun nativeOpen(
-            fd: Int, darkFrames: Int, recalibrateSeconds: Double,
+            fd: Int, replay: String?, darkFrames: Int, recalibrateSeconds: Double,
             palette: String, mirror: Boolean, flip: Boolean, rotation: Int,
         ): Long
         @JvmStatic private external fun nativeStart(handle: Long)

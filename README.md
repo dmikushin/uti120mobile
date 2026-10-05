@@ -58,8 +58,18 @@ Requires the Android SDK with platform 37.2, NDK 28.2.13676358 and CMake
 3.31.6 (`sdkmanager "platforms;android-37.2" "ndk;28.2.13676358" "cmake;3.31.6"`).
 libusb is downloaded at its pinned, hash-checked release and built with the
 NDK; the backend comes from `cpp/core`. Plug the camera into the phone (USB
-OTG), allow access when asked; photos go to `Pictures/UTi120`, videos to
-`Movies/UTi120`.
+OTG), allow access when asked. Tap the capture button for a photo
+(`Pictures/UTi120`); press and hold it to record video until you let go
+(`Movies/UTi120`).
+
+Debug builds can run without the camera on raw frames recorded with
+`uti120 record --raw`:
+
+```sh
+adb push frames.raw /data/local/tmp/replay.raw
+adb shell run-as io.github.dmikushin.uti120 sh -c "'mkdir -p files && cp /data/local/tmp/replay.raw files/'"
+adb shell am start -n io.github.dmikushin.uti120/.MainActivity -e replay /data/data/io.github.dmikushin.uti120/files/replay.raw
+```
 
 ### Python
 

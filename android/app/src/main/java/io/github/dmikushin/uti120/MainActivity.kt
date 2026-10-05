@@ -18,6 +18,9 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         controller = CameraController(applicationContext)
+        // Debug builds can run on recorded frames:
+        //   am start -n io.github.dmikushin.uti120/.MainActivity -e replay /sdcard/Android/data/io.github.dmikushin.uti120/files/replay.raw
+        if (BuildConfig.DEBUG) controller.replay = intent.getStringExtra("replay")
         controller.register()
         setContent { CameraScreen(controller) }
     }

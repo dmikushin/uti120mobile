@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <numeric>
 #include <string>
@@ -15,6 +16,7 @@
 
 #include "uti120/device.hpp"
 #include "uti120/pipeline.hpp"
+#include "uti120/replay.hpp"
 #include "uti120/palette.hpp"
 #include "uti120/process.hpp"
 
@@ -249,6 +251,28 @@ TEST(test_rotation_270_matches_vendor_portrait) {
   CHECK((lum(0, 0) < lum(0, WIDTH - 1)) == (tl < bl));
   CHECK(lum(0, WIDTH - 1) == 0);      // sensor (0,0), the smallest index, is bottom-left
   CHECK(lum(HEIGHT - 1, 0) == 255);   // sensor (119,89), the largest, is top-right
+}
+
+// The whole pipeline (NUC, shutter calibration, capture thread) runs against
+// recorded frames: start succeeds, images arrive and a snapshot averages them.
+TEST(test_pipeline_on_replay) {
+  std::string raw = (std::filesystem::temp_directory_path() / "uti120_replay_test.raw").string();
+  {
+    std::FILE* f = std::fopen(raw.c_str(), "wb");
+    for (auto* name : {"closed16.bin.gz", "open4.bin.gz"})
+      for (auto& b : load(name)) std::fwrite(b.data(), 1, b.size(), f);
+    std::fclose(f);
+  }
+  Pipeline p(open_replay(raw), Settings{8, 0.0, nullptr});
+  p.start();
+  auto im = p.newest(std::chrono::milliseconds(2000));
+  CHECK(im.has_value());
+  Plane s = p.snapshot(3);
+  CHECK(s.size() == size_t(PIXELS));
+  CHECK(p.frames_captured() >= 3);
+  p.stop();
+  std::remove(raw.c_str());
+  CHECK(throws<DeviceError>([&] { open_replay("/nonexistent.raw"); }, "cannot open"));
 }
 
 TEST(test_header) {
