@@ -82,7 +82,9 @@ class Pipeline {
   // none arrived in time or the pipeline is stopped.  Rethrows a capture error.
   std::optional<Image> newest(std::chrono::milliseconds wait);
   // Mean signal of the next n captured images.
-  Plane snapshot(int n, Frame* last = nullptr);
+  // With radiometry, `temperature` (if given) receives the mean temperatures
+  // of the same images.
+  Plane snapshot(int n, Frame* last = nullptr, Plane* temperature = nullptr);
   // The capture thread recalibrates on the shutter before its next frame.
   void request_recalibration() { recalibrate_ = true; }
 

@@ -136,8 +136,9 @@ std::optional<Image> Pipeline::newest(std::chrono::milliseconds wait) {
   return latest_;
 }
 
-Plane Pipeline::snapshot(int n, Frame* last) {
-  std::vector<double> sum(PIXELS, 0.0);
+Plane Pipeline::snapshot(int n, Frame* last, Plane* temperature) {
+  std::vector<double> sum(PIXELS, 0.0), tsum(PIXELS, 0.0);
+  int tcount = 0;
   std::unique_lock lock(mutex_);
   long seen = latest_ ? count_.load() : 0;
   for (int k = 0; k < n; ++k) {
@@ -146,10 +147,21 @@ Plane Pipeline::snapshot(int n, Frame* last) {
     if (stopping_) throw std::runtime_error("pipeline stopped during snapshot");
     seen = count_;
     for (int i = 0; i < PIXELS; ++i) sum[i] += latest_->signal[i];
+    if (latest_->temperature) {
+      for (int i = 0; i < PIXELS; ++i) tsum[i] += (*latest_->temperature)[i];
+      ++tcount;
+    }
     if (last) *last = latest_->frame;
   }
   Plane mean(PIXELS);
   for (int i = 0; i < PIXELS; ++i) mean[i] = float(sum[i] / n);
+  if (temperature) {
+    temperature->clear();
+    if (tcount) {
+      temperature->resize(PIXELS);
+      for (int i = 0; i < PIXELS; ++i) (*temperature)[i] = float(tsum[i] / tcount);
+    }
+  }
   return mean;
 }
 

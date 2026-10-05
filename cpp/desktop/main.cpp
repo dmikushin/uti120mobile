@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
@@ -23,6 +24,7 @@
 #include "uti120/log.hpp"
 #include "uti120/palette.hpp"
 #include "uti120/pipeline.hpp"
+#include "uti120/radiometry.hpp"
 
 extern "C" {
 #include <libavutil/log.h>
@@ -50,6 +52,9 @@ struct Options {
   std::string npy;
   double duration = -1;  // < 0: command default
   std::string raw;
+  bool celsius = false;  // measure temperatures (always for "log")
+  RadiometrySettings radiometry;
+  double interval = 1.0;  // log: seconds between rows
 };
 
 [[noreturn]] void usage(int code) {
@@ -64,6 +69,7 @@ struct Options {
       "  snapshot             save one image (PNG)\n"
       "  record               record a video (H.264 MP4, %d fps)\n"
       "  live                 show live video in a window (Esc or q closes it)\n"
+      "  log                  write min/max/mean/centre temperatures over time as CSV\n"
       "\n"
       "options for snapshot, record, live:\n"
       "  --palette NAME       grey, ironbow (default) or rainbow\n"
@@ -72,10 +78,21 @@ struct Options {
       "  --flip               flip upside-down\n"
       "  --dark-frames N      closed-shutter frames averaged for calibration (default 16)\n"
       "  --recalibrate S      repeat the shutter calibration every S seconds (0 = never)\n"
+      "temperatures (snapshot, live: with --celsius; log: always):\n"
+      "  --celsius            measure temperatures; the first time, the camera's calibration\n"
+      "                       is read and cached in ~/.cache/uti120, which restarts the camera\n"
+      "  --emissivity E       of the target (default 0.95)\n"
+      "  --distance M         to the target in metres (default 0.6)\n"
+      "  --reflected C        reflected (ambient) temperature (default 23)\n"
+      "  --high-range         high measuring range (above ~120 C)\n"
       "snapshot:\n"
       "  -o, --output FILE    default uti120.png\n"
       "  --average N          frames averaged into the image (default 8)\n"
-      "  --npy FILE           also save the offset-corrected signal as .npy\n"
+      "  --npy FILE           also save the signal (with --celsius: temperatures, C) as .npy\n"
+      "log:\n"
+      "  -o, --output FILE    CSV file (default: standard output)\n"
+      "  -t, --duration S     seconds (default 0: until interrupted)\n"
+      "  --interval S         seconds between rows (default 1)\n"
       "record, live:\n"
       "  -o, --output FILE    record only; default uti120.mp4\n"
       "  -t, --duration S     seconds; default 10 for record, 0 (until closed) for live\n"
@@ -109,8 +126,10 @@ Options parse_args(int argc, char** argv) {
       if (i + 1 >= args.size()) fail("option " + a + " needs a value");
       return args[++i].c_str();
     };
-    bool media = o.command == "snapshot" || o.command == "record" || o.command == "live";
-    bool timed = o.command == "record" || o.command == "live";
+    bool media = o.command == "snapshot" || o.command == "record" || o.command == "live" ||
+                 o.command == "log";
+    bool timed = o.command == "record" || o.command == "live" || o.command == "log";
+    bool measure = o.command == "snapshot" || o.command == "live" || o.command == "log";
     if (a == "-h" || a == "--help") usage(0);
     else if (a == "--version") {
       std::printf("uti120 %s\n", UTI120_VERSION);
@@ -119,7 +138,7 @@ Options parse_args(int argc, char** argv) {
     else if (a == "-v" || a == "--verbose") o.verbose++;
     else if (a == "-vv") o.verbose += 2;
     else if (o.command.empty() && a[0] != '-') {
-      if (a != "info" && a != "snapshot" && a != "record" && a != "live")
+      if (a != "info" && a != "snapshot" && a != "record" && a != "live" && a != "log")
         fail("unknown command " + a);
       o.command = a;
     } else if (media && a == "--palette") o.palette = value();
@@ -128,17 +147,27 @@ Options parse_args(int argc, char** argv) {
     else if (media && a == "--flip") o.flip = true;
     else if (media && a == "--dark-frames") o.dark_frames = int(parse_number(a, value(), 1));
     else if (media && a == "--recalibrate") o.recalibrate = parse_number(a, value(), 0);
-    else if ((o.command == "snapshot" || o.command == "record") && (a == "-o" || a == "--output"))
+    else if (measure && a == "--celsius") o.celsius = true;
+    else if (measure && a == "--emissivity") o.radiometry.emissivity = float(parse_number(a, value(), 0.01));
+    else if (measure && a == "--distance") o.radiometry.distance = float(parse_number(a, value(), 0));
+    else if (measure && a == "--reflected") o.radiometry.reflected = float(parse_number(a, value(), -100));
+    else if (measure && a == "--high-range") o.radiometry.high_range = true;
+    else if (o.command == "log" && a == "--interval") o.interval = parse_number(a, value(), 0.01);
+    else if ((o.command == "snapshot" || o.command == "record" || o.command == "log") &&
+             (a == "-o" || a == "--output"))
       o.output = value();
     else if (o.command == "snapshot" && a == "--average") o.average = int(parse_number(a, value(), 1));
     else if (o.command == "snapshot" && a == "--npy") o.npy = value();
     else if (timed && (a == "-t" || a == "--duration")) o.duration = parse_number(a, value(), 0);
-    else if (timed && a == "--raw") o.raw = value();
+    else if (timed && o.command != "log" && a == "--raw") o.raw = value();
     else fail("unexpected argument " + a + (o.command.empty() ? "" : " for " + o.command));
   }
   if (o.command.empty()) usage(2);
-  if (o.output.empty()) o.output = o.command == "snapshot" ? "uti120.png" : "uti120.mp4";
+  if (o.output.empty())
+    o.output = o.command == "snapshot" ? "uti120.png" : o.command == "log" ? "-" : "uti120.mp4";
   if (o.duration < 0) o.duration = o.command == "record" ? 10.0 : 0.0;
+  if (o.command == "log") o.celsius = true;
+  if (o.radiometry.emissivity > 1) fail("emissivity must be at most 1");
   try {
     palette::lut(o.palette);
   } catch (const std::invalid_argument&) {
@@ -160,14 +189,77 @@ File open_raw(const Options& o) {
   return f;
 }
 
+std::string calibration_cache(const std::string& sensor) {
+  const char* xdg = std::getenv("XDG_CACHE_HOME");
+  const char* home = std::getenv("HOME");
+  std::string base = xdg && *xdg ? xdg : std::string(home ? home : ".") + "/.cache";
+  return base + "/uti120/" + sensor;
+}
+
+// The camera's calibration for temperatures: read from the camera once and
+// cached per sensor (same files as the Python tool).  Reading it stops the
+// camera's frame stream until it is rebooted, so the camera is then rebooted
+// and this returns once it is back.
+CameraCalibration camera_calibration() {
+  std::string dir;
+  {
+    Camera cam(open_usb());
+    dir = calibration_cache(cam.info().sensor);
+    if (std::filesystem::exists(dir + "/coefficients.json")) {
+      LOG_INFO("uti120", "calibration from %s", dir.c_str());
+      return CameraCalibration::load(dir);
+    }
+    std::fprintf(stderr, "uti120: reading the camera's calibration (once; cached in %s)\n", dir.c_str());
+    CameraCalibration cal = read_camera_calibration(cam);
+    std::filesystem::create_directories(dir);
+    cal.save(dir);
+    try {
+      cam.write_reg(SYS_WRITE, REG_REBOOT, 1);
+    } catch (const DeviceError&) {
+      // the camera may go away before it answers
+    }
+  }  // released before the camera re-enumerates
+  // Wait for the camera to come back on the bus and finish its start-up.
+  std::this_thread::sleep_for(std::chrono::seconds(1));
+  for (double deadline = monotonic_s() + 15;;) {
+    try {
+      if (Camera(open_usb()).info().init_status == 1) break;
+    } catch (const DeviceError& e) {
+      if (monotonic_s() > deadline) fail(std::string("camera did not come back after reboot: ") + e.what());
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  }
+  return CameraCalibration::load(dir);
+}
+
 std::unique_ptr<Pipeline> start_pipeline(const Options& o, std::FILE* raw) {
   View view;
   view.palette = o.palette;
   view.mirror = o.mirror;
   view.flip = o.flip;
-  auto p = std::make_unique<Pipeline>(open_usb(), Settings{o.dark_frames, o.recalibrate, raw}, view);
+  Settings settings{o.dark_frames, o.recalibrate, raw};
+  if (o.celsius) {
+    settings.calibration = camera_calibration();
+    settings.radiometry = o.radiometry;
+  }
+  auto p = std::make_unique<Pipeline>(open_usb(), settings, view);
   p->start();
   return p;
+}
+
+struct Summary {
+  float min, max, mean, centre;
+};
+
+Summary summarize(const Plane& t) {
+  double sum = 0;
+  float lo = t[0], hi = t[0];
+  for (float v : t) {
+    lo = std::min(lo, v);
+    hi = std::max(hi, v);
+    sum += v;
+  }
+  return {lo, hi, float(sum / double(t.size())), t[(HEIGHT / 2) * WIDTH + WIDTH / 2]};
 }
 
 int cmd_info() {
@@ -181,15 +273,21 @@ int cmd_info() {
 
 int cmd_snapshot(const Options& o) {
   Frame last;
-  Plane mean;
+  Plane mean, temperature;
   RgbImage img;
   {
     auto p = start_pipeline(o, nullptr);
-    mean = p->snapshot(o.average, &last);
+    mean = p->snapshot(o.average, &last, &temperature);
     img = p->render(mean);
   }
   write_png(o.output, img.rgb.data(), img.width, img.height, o.scale);
-  if (!o.npy.empty()) write_npy(o.npy, mean, HEIGHT, WIDTH);
+  if (o.celsius) {
+    if (temperature.empty()) fail("no temperatures were measured");
+    Summary s = summarize(temperature);
+    std::printf("temperature: min %.1f C, max %.1f C, mean %.1f C, centre %.1f C\n", s.min, s.max,
+                s.mean, s.centre);
+  }
+  if (!o.npy.empty()) write_npy(o.npy, o.celsius ? temperature : mean, HEIGHT, WIDTH);
   std::vector<double> v(mean.begin(), mean.end());
   std::printf("%s: %s, signal p1/p50/p99 = [%.1f, %.1f, %.1f]\n", o.output.c_str(),
               last.describe().c_str(), percentile(v, 1), percentile(v, 50), percentile(v, 99));
@@ -216,7 +314,7 @@ int pump(const Options& o, MakeSink&& make_sink) {
       while (!g_interrupted && (o.duration == 0 || ticks < o.duration * VIDEO_FPS)) {
         im = p->newest(std::chrono::milliseconds(50));
         if (!im) continue;
-        if (!sink(p->render(im->signal).rgb.data())) break;
+        if (!sink(p->render(im->signal).rgb.data(), *im)) break;
         ++ticks;
         double delay = t0 + double(ticks) / VIDEO_FPS - monotonic_s();
         if (delay > 0) std::this_thread::sleep_for(std::chrono::duration<double>(delay));
@@ -235,7 +333,7 @@ int cmd_record(const Options& o) {
   std::unique_ptr<VideoWriter> video;
   int rc = pump(o, [&](int w, int h) {
     video = std::make_unique<VideoWriter>(o.output, w, h, o.scale, VIDEO_FPS);
-    return [&](const uint8_t* rgb) {
+    return [&](const uint8_t* rgb, const Image&) {
       video->write(rgb);
       return true;
     };
@@ -248,11 +346,45 @@ int cmd_live(const Options& o) {
   std::unique_ptr<Display> display;
   return pump(o, [&](int w, int h) {
     display = std::make_unique<Display>("UTi120Mobile", w, h, o.scale);
-    return [&](const uint8_t* rgb) {
+    return [&](const uint8_t* rgb, const Image& im) {
       display->show(rgb);
+      if (im.temperature) {
+        Summary s = summarize(*im.temperature);
+        char title[96];
+        std::snprintf(title, sizeof title, "UTi120Mobile  centre %.1f C  min %.1f C  max %.1f C",
+                      s.centre, s.min, s.max);
+        display->set_title(title);
+      }
       return display->poll();
     };
   });
+}
+
+// One CSV row per interval: for watching a GPU or anything else heat up.
+int cmd_log(const Options& o) {
+  File file;
+  std::FILE* out = stdout;
+  if (o.output != "-") {
+    file.reset(std::fopen(o.output.c_str(), "w"));
+    if (!file) fail("cannot open " + o.output + ": " + std::strerror(errno));
+    out = file.get();
+  }
+  std::fprintf(out, "time_s,min_c,max_c,mean_c,centre_c,camera_fpa_c\n");
+  auto p = start_pipeline(o, nullptr);
+  double t0 = monotonic_s(), next = t0;
+  long last_count = -1;
+  while (!g_interrupted && (o.duration == 0 || monotonic_s() - t0 < o.duration)) {
+    std::optional<Image> im = p->newest(std::chrono::milliseconds(100));
+    if (!im || !im->temperature || p->frames_captured() == last_count || monotonic_s() < next)
+      continue;
+    last_count = p->frames_captured();
+    Summary s = summarize(*im->temperature);
+    std::fprintf(out, "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n", monotonic_s() - t0, s.min, s.max, s.mean,
+                 s.centre, im->frame.fpa_temp());
+    std::fflush(out);
+    next += o.interval;
+  }
+  return 0;
 }
 
 }  // namespace
@@ -268,6 +400,7 @@ int main(int argc, char** argv) {
     if (o.command == "info") return cmd_info();
     if (o.command == "snapshot") return cmd_snapshot(o);
     if (o.command == "record") return cmd_record(o);
+    if (o.command == "log") return cmd_log(o);
     return cmd_live(o);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "uti120: %s\n", e.what());
