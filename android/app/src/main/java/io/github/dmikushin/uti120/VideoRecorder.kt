@@ -25,7 +25,7 @@ class VideoRecorder(output: ParcelFileDescriptor, imageWidth: Int, imageHeight: 
 
     private val codec: MediaCodec
     private val surface: Surface
-    private val muxer = MediaMuxer(output.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+    private val muxer: MediaMuxer
     private val fd = output
     private val paint = Paint(Paint.FILTER_BITMAP_FLAG)
     private val drainer: Thread
@@ -33,6 +33,8 @@ class VideoRecorder(output: ParcelFileDescriptor, imageWidth: Int, imageHeight: 
     var frames = 0
         private set
 
+    // Takes ownership of [output]: it is closed by finish(), or here if
+    // setting up the encoder fails.
     init {
         val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
@@ -40,10 +42,25 @@ class VideoRecorder(output: ParcelFileDescriptor, imageWidth: Int, imageHeight: 
             setInteger(MediaFormat.KEY_FRAME_RATE, FPS)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
         }
-        codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-        codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        surface = codec.createInputSurface()
-        codec.start()
+        var m: MediaMuxer? = null
+        var c: MediaCodec? = null
+        var s: Surface? = null
+        try {
+            m = MediaMuxer(output.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            c = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            c.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            s = c.createInputSurface()
+            c.start()
+        } catch (e: Exception) {
+            s?.release()
+            c?.release()
+            m?.release()
+            output.close()
+            throw e
+        }
+        muxer = m
+        codec = c
+        surface = s
         drainer = Thread({ drain() }, "uti120-video").apply { start() }
     }
 

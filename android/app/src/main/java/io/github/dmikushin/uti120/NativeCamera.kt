@@ -24,30 +24,33 @@ data class CameraSettings(
  * thread.  Native failures arrive as RuntimeException with the backend's message.
  */
 class NativeCamera(fd: Int, settings: CameraSettings, view: ViewSettings) : AutoCloseable {
-    private var handle: Long = nativeOpen(
+    @Volatile private var handle: Long = nativeOpen(
         fd, settings.darkFrames, settings.recalibrateSeconds.toDouble(),
         view.palette, view.mirror, view.flip, view.rotation,
     )
 
-    fun start() = nativeStart(handle)
+    /** The native handle; using a closed camera is a programming error, not a crash. */
+    private fun h(): Long = handle.also { check(it != 0L) { "camera is closed" } }
+
+    fun start() = nativeStart(h())
 
     /** Width and height of rendered images with the current view. */
-    fun imageSize(): Pair<Int, Int> = nativeImageSize(handle).let { it[0] to it[1] }
+    fun imageSize(): Pair<Int, Int> = nativeImageSize(h()).let { it[0] to it[1] }
 
     fun newBitmap(): Bitmap = imageSize().let { (w, h) -> createBitmap(w, h) }
 
     /** Renders the newest image; false if none is available yet. */
-    fun render(into: Bitmap): Boolean = nativeRender(handle, into)
+    fun render(into: Bitmap): Boolean = nativeRender(h(), into)
 
     /** The average of the next [frames] images. */
-    fun snapshot(frames: Int): Bitmap = newBitmap().also { nativeSnapshot(handle, frames, it) }
+    fun snapshot(frames: Int): Bitmap = newBitmap().also { nativeSnapshot(h(), frames, it) }
 
     fun setView(view: ViewSettings) =
-        nativeSetView(handle, view.palette, view.mirror, view.flip, view.rotation)
+        nativeSetView(h(), view.palette, view.mirror, view.flip, view.rotation)
 
-    fun recalibrate() = nativeRecalibrate(handle)
+    fun recalibrate() = nativeRecalibrate(h())
 
-    fun framesCaptured(): Long = nativeFramesCaptured(handle)
+    fun framesCaptured(): Long = nativeFramesCaptured(h())
 
     /** Stops capturing and returns the camera to idle. */
     override fun close() {

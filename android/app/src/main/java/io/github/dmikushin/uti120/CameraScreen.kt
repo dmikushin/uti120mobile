@@ -186,8 +186,8 @@ private fun OrientationBar(c: CameraController, modifier: Modifier) {
     ) {
         ToolButton(Icons.Filled.Flip, "Mirror", v.mirror) { c.updateView(v.copy(mirror = !v.mirror)) }
         ToolButton(Icons.Filled.Flip, "Flip", v.flip, iconRotation = 90f) { c.updateView(v.copy(flip = !v.flip)) }
-        // Rotation changes the image size, which a running recording cannot follow.
-        ToolButton(Icons.AutoMirrored.Filled.RotateRight, "Rotate ${v.rotation}°", false, enabled = !c.recording) {
+        // Rotation changes the image size, which a running (or starting) recording cannot follow.
+        ToolButton(Icons.AutoMirrored.Filled.RotateRight, "Rotate ${v.rotation}°", false, enabled = !c.recording && !c.busy) {
             c.updateView(v.copy(rotation = (v.rotation + 90) % 360))
         }
     }

@@ -1,15 +1,18 @@
 # uti120
 
-Linux driver and video tools for the **UNI-T UTi120Mobile** USB thermal camera
-(120×90 microbolometer, USB ID `5656:1201`). The vendor only supports Android;
-this is an independent open-source implementation, in two forms with the same
-commands and the same image processing:
+Driver, video tools and an Android app for the **UNI-T UTi120Mobile** USB
+thermal camera (120×90 microbolometer, USB ID `5656:1201`). This is an
+independent open-source implementation; all forms share the same protocol
+handling and image processing:
 
 * **Python** (`src/`) — a small library and CLI on pyusb; video goes through
   external `ffmpeg`/`ffplay` processes.
 * **C++** (`cpp/`) — a single self-contained executable: USB, calibration,
   H.264/MP4 encoding, PNG and the live window all run in one process, with
   libusb, FFmpeg, x264 and SDL3 linked in statically.
+* **Android** (`android/`) — a Kotlin/Jetpack Compose app on the same C++
+  backend (`cpp/core`), with the vendor app's screen layout: live image, photo
+  and video capture, palettes, mirror/flip/rotate, tap to recalibrate.
 
 ## Example
 
@@ -42,6 +45,21 @@ building, or the corresponding SDL3 backend is left out).
 The C++ code is split into the backend `cpp/core` (protocol, calibration,
 processing, rendering; a static library with no media dependencies) and the
 desktop frontend `cpp/desktop` (command line, FFmpeg/x264 encoding, SDL3 window).
+
+### Android
+
+```sh
+cd android
+echo "sdk.dir=$HOME/Android/Sdk" > local.properties
+./gradlew assembleDebug       # app/build/outputs/apk/debug/app-debug.apk
+```
+
+Requires the Android SDK with platform 37.2, NDK 28.2.13676358 and CMake
+3.31.6 (`sdkmanager "platforms;android-37.2" "ndk;28.2.13676358" "cmake;3.31.6"`).
+libusb is downloaded at its pinned, hash-checked release and built with the
+NDK; the backend comes from `cpp/core`. Plug the camera into the phone (USB
+OTG), allow access when asked; photos go to `Pictures/UTi120`, videos to
+`Movies/UTi120`.
 
 ### Python
 
@@ -111,4 +129,5 @@ ctest --test-dir cpp/build
 
 The source code in this repository is MIT-licensed. The C++ executable links
 x264 and an FFmpeg build configured with `--enable-gpl`, so the executable as a
-whole is distributed under the GNU GPL version 2 or later.
+whole is distributed under the GNU GPL version 2 or later. The Android app
+links libusb statically, which is under the GNU LGPL 2.1.

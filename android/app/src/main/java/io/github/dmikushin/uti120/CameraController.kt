@@ -58,6 +58,10 @@ class CameraController(private val context: Context) {
         private set
 
     private val usb = context.getSystemService(Context.USB_SERVICE) as UsbManager
+    // Incremented on every connect and disconnect (main thread).  Results of
+    // background work carry the session they belong to and are dropped when
+    // it is over, e.g. a start that finishes after the camera was unplugged.
+    private var session = 0
     private val main = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadExecutor { Thread(it, "uti120-camera") }
 
@@ -108,30 +112,36 @@ class CameraController(private val context: Context) {
             return
         }
         setPhase(Phase.Starting, "")
+        val id = ++session
+        val s = settings
+        val v = view
         worker.execute {
             try {
                 val conn = usb.openDevice(device) ?: error("cannot open the USB device")
                 connection = conn
-                val cam = NativeCamera(conn.fileDescriptor, settings, view)
+                val cam = NativeCamera(conn.fileDescriptor, s, v)
                 camera = cam
                 cam.start()
-                startRendering(cam)
-                main.post { setPhase(Phase.Live, "") }
+                startRendering(cam, id)
+                main.post { if (session == id) setPhase(Phase.Live, "") }
             } catch (e: Exception) {
                 Log.e(TAG, "camera start failed", e)
                 closeCamera()
-                main.post { fail(e.message ?: e.toString()) }
+                main.post { if (session == id) fail(e.message ?: e.toString()) }
             }
         }
     }
 
     fun disconnect(next: Phase = Phase.NoCamera, why: String = "") {
+        session++
         worker.execute { closeCamera() }
         setPhase(next, why)
         image = null
     }
 
     fun shutdown() {
+        session++
+        main.removeCallbacksAndMessages(null)
         worker.execute { closeCamera() }
         worker.shutdown()
     }
@@ -187,9 +197,9 @@ class CameraController(private val context: Context) {
                     val uri = Captures.newVideo(context.contentResolver)
                     videoUri = uri
                     try {
-                        val fd = context.contentResolver.openFileDescriptor(uri, "rw") ?: error("cannot open $uri")
                         val (w, h) = camera!!.imageSize()
-                        val created = VideoRecorder(fd, w, h)
+                        val fd = context.contentResolver.openFileDescriptor(uri, "rw") ?: error("cannot open $uri")
+                        val created = VideoRecorder(fd, w, h)  // closes fd itself if it fails
                         synchronized(recorderLock) { recorder = created }
                     } catch (e: Exception) {
                         Captures.discard(context.contentResolver, uri)
@@ -219,6 +229,7 @@ class CameraController(private val context: Context) {
         videoUri = null
         return try {
             active.finish()
+            check(active.frames > 0) { "no frames were recorded" }
             Captures.publish(context.contentResolver, uri)
             uri
         } catch (e: Exception) {
@@ -227,12 +238,12 @@ class CameraController(private val context: Context) {
         }
     }
 
-    private fun startRendering(cam: NativeCamera) {
+    private fun startRendering(cam: NativeCamera, id: Int) {
         rendering = true
-        renderer = Thread({ renderLoop(cam) }, "uti120-render").apply { start() }
+        renderer = Thread({ renderLoop(cam, id) }, "uti120-render").apply { start() }
     }
 
-    private fun renderLoop(cam: NativeCamera) {
+    private fun renderLoop(cam: NativeCamera, id: Int) {
         val period = 1000L / VideoRecorder.FPS
         var next = SystemClock.uptimeMillis()
         var statAt = next
@@ -243,19 +254,19 @@ class CameraController(private val context: Context) {
                 if (cam.render(bitmap)) {
                     synchronized(recorderLock) { recorder?.write(bitmap) }
                     val shown = bitmap.asImageBitmap()
-                    main.post { image = shown }
+                    main.post { if (session == id) image = shown }
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "rendering failed", e)
                 rendering = false
-                main.post { disconnect(Phase.Failed, e.message ?: e.toString()) }
+                main.post { if (session == id) disconnect(Phase.Failed, e.message ?: e.toString()) }
                 return
             }
             val now = SystemClock.uptimeMillis()
             if (now - statAt >= 1000) {
                 val frames = cam.framesCaptured()
                 val rate = (frames - statFrames) * 1000.0 / (now - statAt)
-                main.post { fps = rate }
+                main.post { if (session == id) fps = rate }
                 statAt = now
                 statFrames = frames
             }

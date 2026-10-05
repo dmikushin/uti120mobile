@@ -68,6 +68,8 @@ class Pipeline {
 
   // Streaming, on-camera NUC and shutter calibration (blocks for ~4 s), then
   // the capture thread is started.  On failure the camera is left idle.
+  // Throws std::logic_error if already started.  start() and stop() may be
+  // called from different threads; stop() waits for a running start().
   void start();
   // Stops the capture thread and returns the camera to idle.  Idempotent.
   void stop();
@@ -90,6 +92,7 @@ class Pipeline {
  private:
   void run();
 
+  std::mutex lifecycle_;  // serialises start() and stop()
   Camera cam_;
   Stream stream_;
   std::mutex render_mutex_;

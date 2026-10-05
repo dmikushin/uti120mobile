@@ -39,8 +39,11 @@ auto guarded(JNIEnv* env, F&& f, decltype(f()) fallback) -> decltype(f()) {
   return fallback;
 }
 
+// Throws if the string is null or cannot be read (a Java exception is then pending).
 std::string to_string(JNIEnv* env, jstring s) {
+  if (!s) throw std::invalid_argument("null string");
   const char* c = env->GetStringUTFChars(s, nullptr);
+  if (!c) throw std::runtime_error("cannot read Java string");
   std::string out(c);
   env->ReleaseStringUTFChars(s, c);
   return out;
@@ -119,7 +122,8 @@ JNIEXPORT jboolean JNICALL Java_io_github_dmikushin_uti120_NativeCamera_nativeRe
     if (!im) return JNI_FALSE;
     RgbImage img = p->render(im->signal);
     AndroidBitmapInfo info;
-    AndroidBitmap_getInfo(env, bitmap, &info);
+    if (AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS)
+      throw std::runtime_error("cannot read bitmap info");
     if (int(info.width) != img.width || int(info.height) != img.height) return JNI_FALSE;
     return copy_into(env, bitmap, img) ? JNI_TRUE : JNI_FALSE;
   }, jboolean(JNI_FALSE));

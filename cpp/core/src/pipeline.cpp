@@ -58,13 +58,23 @@ Pipeline::~Pipeline() {
 }
 
 void Pipeline::start() {
+  std::lock_guard life(lifecycle_);
+  if (streaming_) throw std::logic_error("pipeline already started");
   stream_.start();  // returns the camera to idle itself if it throws
+  {
+    // A previous session's image, error or count must not leak into this one.
+    std::lock_guard lock(mutex_);
+    latest_.reset();
+    error_ = nullptr;
+    count_ = 0;
+    stopping_ = false;
+  }
   streaming_ = true;
-  stopping_ = false;
   thread_ = std::thread([this] { run(); });
 }
 
 void Pipeline::stop() {
+  std::lock_guard life(lifecycle_);
   {
     std::lock_guard lock(mutex_);
     stopping_ = true;
