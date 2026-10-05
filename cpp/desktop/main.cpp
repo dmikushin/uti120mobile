@@ -82,7 +82,8 @@ struct Options {
       "  --raw FILE           also write every raw 25600-byte frame to FILE\n"
       "\n"
       "  -v                   log progress (-vv: protocol debug)\n"
-      "  -h, --help           this help\n",
+      "  -h, --help           this help\n"
+      "  --version            print the version\n",
       VIDEO_FPS);
   std::exit(code);
 }
@@ -111,6 +112,10 @@ Options parse_args(int argc, char** argv) {
     bool media = o.command == "snapshot" || o.command == "record" || o.command == "live";
     bool timed = o.command == "record" || o.command == "live";
     if (a == "-h" || a == "--help") usage(0);
+    else if (a == "--version") {
+      std::printf("uti120 %s\n", UTI120_VERSION);
+      std::exit(0);
+    }
     else if (a == "-v" || a == "--verbose") o.verbose++;
     else if (a == "-vv") o.verbose += 2;
     else if (o.command.empty() && a[0] != '-') {

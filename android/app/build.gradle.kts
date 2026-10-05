@@ -1,6 +1,15 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.plugin.compose")
+}
+
+// Release signing key, kept outside the repository:
+// ~/.android/uti120-release.properties with storeFile, storePassword, keyAlias, keyPassword.
+val releaseKey = Properties().apply {
+    val f = File(System.getProperty("user.home"), ".android/uti120-release.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
 }
 
 android {
@@ -16,8 +25,8 @@ android {
         // MediaStore relative paths (Pictures/UTi120, Movies/UTi120) need API 29.
         minSdk = 29
         targetSdk = 37
-        versionCode = 5
-        versionName = "0.1.4"
+        versionCode = 6
+        versionName = "0.2.0"
         ndk {
             // Phones, and the x86_64 emulator used for testing.
             abiFilters += listOf("arm64-v8a", "x86_64")
@@ -26,6 +35,26 @@ android {
             cmake {
                 arguments += listOf("-DANDROID_STL=c++_static")
             }
+        }
+    }
+
+    signingConfigs {
+        if (releaseKey.isNotEmpty()) {
+            create("release") {
+                storeFile = file(releaseKey.getProperty("storeFile"))
+                storePassword = releaseKey.getProperty("storePassword")
+                keyAlias = releaseKey.getProperty("keyAlias")
+                keyPassword = releaseKey.getProperty("keyPassword")
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+            signingConfig = signingConfigs.findByName("release")
         }
     }
 

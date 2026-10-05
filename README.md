@@ -11,15 +11,15 @@ handling and image processing:
   H.264/MP4 encoding, PNG and the live window all run in one process, with
   libusb, FFmpeg, x264 and SDL3 linked in statically.
 * **Android** (`android/`) — a Kotlin/Jetpack Compose app on the same C++
-  backend (`cpp/core`), with the vendor app's screen layout: live image, photo
-  and video capture, palettes, mirror/flip/rotate, tap to recalibrate.
+  backend (`cpp/core`), with the vendor app's screen layout: live image, tap
+  for a photo and hold for video, palettes, tap the image to recalibrate.
 
 ## Example
 
-![Thermal image of a running PC motherboard](docs/example-motherboard.png)
+<img src="docs/screenshot-android.jpg" width="360" alt="The Android app showing a thermal image of a PC motherboard">
 
-A running PC motherboard, `uti120 snapshot` with the default ironbow palette:
-120×90 sensor pixels upscaled ×4, 8 frames averaged; brighter is warmer.
+The Android app on a phone, looking at a running PC motherboard (ironbow
+palette; brighter is warmer).
 
 ## Install
 
