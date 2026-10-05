@@ -47,7 +47,29 @@ Pipeline::Pipeline(std::unique_ptr<Transport> transport, const Settings& setting
                    const View& view)
     : cam_(std::move(transport)),
       stream_(cam_, settings.dark_frames, settings.recalibrate_s, settings.raw_sink),
-      renderer_(view) {}
+      renderer_(view),
+      radiometry_enabled_(settings.calibration.has_value()),
+      radiometry_(settings.radiometry) {
+  if (settings.calibration) stream_.enable_radiometry(*settings.calibration, settings.radiometry);
+}
+
+void Pipeline::set_radiometry(const RadiometrySettings& settings) {
+  std::lock_guard lock(radiometry_mutex_);
+  radiometry_ = settings;
+  radiometry_pending_ = true;
+}
+
+RadiometrySettings Pipeline::radiometry() {
+  std::lock_guard lock(radiometry_mutex_);
+  return radiometry_;
+}
+
+void Pipeline::apply_radiometry() {
+  std::lock_guard lock(radiometry_mutex_);
+  if (!radiometry_pending_) return;
+  radiometry_pending_ = false;
+  stream_.set_radiometry(radiometry_);
+}
 
 Pipeline::~Pipeline() {
   try {
@@ -60,6 +82,7 @@ Pipeline::~Pipeline() {
 void Pipeline::start() {
   std::lock_guard life(lifecycle_);
   if (streaming_) throw std::logic_error("pipeline already started");
+  apply_radiometry();  // the capture thread is not running yet
   stream_.start();  // returns the camera to idle itself if it throws
   {
     // A previous session's image, error or count must not leak into this one.
@@ -90,6 +113,7 @@ void Pipeline::stop() {
 void Pipeline::run() {
   try {
     while (!stopping_) {
+      apply_radiometry();
       if (recalibrate_.exchange(false)) stream_.calibrate();
       Image im = stream_.read();
       std::lock_guard lock(mutex_);

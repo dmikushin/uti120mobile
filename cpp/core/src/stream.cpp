@@ -20,7 +20,18 @@ Frame Stream::grab() {
   Frame f = cam_.grab();
   if (raw_sink_ && std::fwrite(f.words.data(), 1, FRAME_BYTES, raw_sink_) != FRAME_BYTES)
     throw std::runtime_error("cannot write raw frame");
+  if (radiometer_) last_temperature_ = radiometer_->feed(f);
   return f;
+}
+
+void Stream::enable_radiometry(const CameraCalibration& calibration,
+                               const RadiometrySettings& settings) {
+  radiometer_.emplace(calibration, settings);
+  last_temperature_.reset();
+}
+
+void Stream::set_radiometry(const RadiometrySettings& settings) {
+  if (radiometer_) radiometer_->set_settings(settings);
 }
 
 void Stream::start() {
@@ -77,7 +88,9 @@ Image Stream::read() {
   if (recalibrate_s_ > 0 && monotonic_s() - calibrated_at_ > recalibrate_s_) calibrate();
   Frame f = grab();
   Plane signal = calibration_->apply(f.pixels());
-  return {f, std::move(signal)};
+  std::optional<Plane> temperature = std::move(last_temperature_);
+  last_temperature_.reset();
+  return {f, std::move(signal), std::move(temperature)};
 }
 
 void Stream::stop() { cam_.stop(); }

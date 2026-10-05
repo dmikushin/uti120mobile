@@ -1,6 +1,7 @@
 #include "uti120/device.hpp"
 
 #include <libusb.h>
+#include <zlib.h>
 
 #include <chrono>
 #include <cstdio>
@@ -264,6 +265,54 @@ Frame Camera::grab(int retries) {
   }
   account(false);
   throw DeviceError("no valid frame after " + std::to_string(retries) + " requests");
+}
+
+std::vector<uint8_t> Camera::read_calibration(CalibrationPackage which) {
+  // Protocol of the vendor's UploadThread_ParamPkg.
+  const bool high = which == CalibrationPackage::High;
+  const uint32_t address = high ? 0x100000 : 0x132000;
+  const uint32_t length = read_regs(SYS_READ, high ? 12 : 13)[0];
+  if (length == 0 || length > 16 * 1024 * 1024)
+    throw DeviceError("implausible calibration package length " + std::to_string(length));
+  auto be32 = [](uint32_t v) {
+    return std::vector<uint8_t>{uint8_t(v >> 24), uint8_t(v >> 16), uint8_t(v >> 8), uint8_t(v)};
+  };
+  auto transfer = [&](uint8_t offset, std::vector<uint8_t> values) {
+    std::vector<uint8_t> req{TRANSFER, offset, uint8_t(values.size() / 4)};
+    req.insert(req.end(), values.begin(), values.end());
+    auto reply = transact(req);
+    if (reply.size() < 3 || reply[0] != req[0] || reply[1] != req[1] || reply[2] != req[2])
+      throw DeviceError("bad reply to transfer command " + hex(req) + ": " + hex(reply));
+  };
+
+  drain_bulk();
+  set_run_status(RUN_IDLE);
+  set_run_status(RUN_UPLOAD);
+  {
+    auto v = be32(address);
+    auto n = be32(length);
+    v.insert(v.end(), n.begin(), n.end());
+    transfer(0, v);  // begin
+  }
+  std::vector<uint8_t> data;
+  data.reserve(length);
+  while (data.size() < length) {
+    auto block = transport_->read(EP_BULK_IN, CHUNK, 1000);
+    if (!block) throw DeviceError("calibration upload stalled after " + std::to_string(data.size()) + " bytes");
+    uint32_t crc = uint32_t(crc32(0L, block->data(), uInt(block->size())));
+    auto v = be32(crc);
+    auto n = be32(uint32_t(block->size()));
+    v.insert(v.end(), n.begin(), n.end());
+    transfer(2, v);  // acknowledge the block
+    data.insert(data.end(), block->begin(), block->end());
+  }
+  if (data.size() != length)
+    throw DeviceError("calibration upload: got " + std::to_string(data.size()) + " bytes, expected " +
+                      std::to_string(length));
+  transfer(4, be32(uint32_t(crc32(0L, data.data(), uInt(data.size())))));  // end
+  set_run_status(RUN_IDLE);
+  LOG_INFO(LOG, "read %s calibration package: %u bytes", high ? "high" : "low", length);
+  return data;
 }
 
 void Camera::start() {

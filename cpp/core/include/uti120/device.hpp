@@ -40,6 +40,7 @@ constexpr uint8_t SYS_READ = 0x05;
 constexpr uint8_t SENSOR_WRITE = 0x0A;
 constexpr uint8_t SENSOR_READ = 0x0B;
 constexpr uint8_t REQUEST_FRAME = 0x81;
+constexpr uint8_t TRANSFER = 0x09;  // flash upload: begin / block ack / end
 
 // System registers (SYS_READ / SYS_WRITE).
 constexpr uint8_t REG_FACTORY_ID = 0x00;
@@ -57,6 +58,14 @@ constexpr uint8_t SREG_NUC = 0x04;      // write 1 to trigger the on-camera offs
 
 constexpr uint32_t RUN_IDLE = 0;
 constexpr uint32_t RUN_STREAM = 2;
+constexpr uint32_t RUN_UPLOAD = 3;
+
+// Calibration packages stored in the camera's flash, read by the vendor app at
+// start-up and handed to its temperature code (UnitArmInterface_ByGuide.getGuiderPackage).
+enum class CalibrationPackage {
+  Low = 0,   // address 0x132000, length in system register 13
+  High = 1,  // address 0x100000, length in system register 12
+};
 
 constexpr unsigned CMD_TIMEOUT_MS = 300;
 constexpr int CHUNK = 4096;
@@ -122,6 +131,11 @@ class Camera {
 
   void start();
   void stop() { set_run_status(RUN_IDLE); }
+
+  // Reads a calibration package from the camera's flash.  The camera must not
+  // be streaming; it is left idle.  Every 4096-byte block is acknowledged with
+  // its CRC-32 and the whole package is checked against its CRC-32.
+  std::vector<uint8_t> read_calibration(CalibrationPackage which);
 
   Transport& transport() { return *transport_; }
   std::optional<int> last_frame_id;

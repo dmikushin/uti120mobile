@@ -6,6 +6,7 @@
 
 #include "uti120/device.hpp"
 #include "uti120/process.hpp"
+#include "uti120/radiometry.hpp"
 
 namespace uti120 {
 
@@ -17,6 +18,9 @@ constexpr int SHUTTER_SETTLE_FRAMES = 2;
 struct Image {
   Frame frame;
   Plane signal;  // offset-corrected counts
+  // Degrees C per pixel, same layout as signal; only with radiometry enabled,
+  // and not before the radiometer has seen its first shutter frame.
+  std::optional<Plane> temperature;
 };
 
 class Stream {
@@ -37,6 +41,14 @@ class Stream {
 
   const Calibration& calibration() const { return *calibration_; }
 
+  // From now on every grabbed frame (shutter frames included, in order) is fed
+  // to a radiometer, and read() returns temperatures.  Not thread-safe: call it
+  // from the thread that reads, or before start().
+  void enable_radiometry(const CameraCalibration& calibration, const RadiometrySettings& settings);
+  // Changes the settings of an enabled radiometer (same threading rule).
+  void set_radiometry(const RadiometrySettings& settings);
+  bool radiometry_enabled() const { return radiometer_.has_value(); }
+
  private:
   Frame grab();
   void wait_shutter(bool closed);
@@ -47,6 +59,8 @@ class Stream {
   std::FILE* raw_sink_;
   std::optional<Calibration> calibration_;
   double calibrated_at_ = 0.0;
+  std::optional<Radiometer> radiometer_;
+  std::optional<Plane> last_temperature_;  // of the most recently grabbed frame
 };
 
 double monotonic_s();
