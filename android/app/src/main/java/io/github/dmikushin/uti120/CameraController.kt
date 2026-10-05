@@ -98,11 +98,23 @@ class CameraController(private val context: Context) {
     private var videoUri: Uri? = null
     // The camera restarted after its calibration was read; the one that comes back must be it.
     private var restartedSensor: String? = null
+    // Device name the open permission request is for (main thread).
+    private var permissionFor: String? = null
+    // Set when the camera has gone off the bus during its restart (any thread).
+    @Volatile private var detachedSinceRestart = false
+    // Signalled when a camera is attached or detached (USB broadcasts), so the
+    // restart wait reacts at once instead of on its next poll.
+    private val usbEvents = Object()
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context, intent: Intent) {
             when (intent.action) {
                 ACTION_PERMISSION -> {
+                    // Only the answer to our own open request, for the camera we asked about.
+                    if (phase != Phase.AwaitingPermission) return
+                    val answered = device(intent)
+                    if (answered == null || answered.deviceName != permissionFor) return
+                    permissionFor = null
                     if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) {
                         setPhase(Phase.NoCamera, "")  // the request is answered
                         connect()
@@ -111,16 +123,32 @@ class CameraController(private val context: Context) {
                     }
                 }
                 UsbManager.ACTION_USB_DEVICE_DETACHED -> {
+                    if (device(intent)?.let(::isCamera) != true) return
                     // While the calibration is read the camera is restarted on purpose.
                     val expected = phase == Phase.ReadingCalibration || phase == Phase.Restarting
-                    if (!expected && device(intent)?.let(::isCamera) == true) disconnect(Phase.NoCamera, "")
+                    if (expected) {
+                        detachedSinceRestart = true
+                        synchronized(usbEvents) { usbEvents.notifyAll() }
+                    } else {
+                        disconnect(Phase.NoCamera, "")
+                    }
+                }
+                UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
+                    if (device(intent)?.let(::isCamera) != true) return
+                    synchronized(usbEvents) { usbEvents.notifyAll() }
+                    // During a restart the wait connects.  After a failure the user
+                    // decides (Retry): an automatic retry could loop on a persistent error.
+                    if (phase == Phase.NoCamera) connect()
                 }
             }
         }
     }
 
     fun register() {
-        val filter = IntentFilter(ACTION_PERMISSION).apply { addAction(UsbManager.ACTION_USB_DEVICE_DETACHED) }
+        val filter = IntentFilter(ACTION_PERMISSION).apply {
+            addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
+            addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
+        }
         ContextCompat.registerReceiver(context, receiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
     }
 
@@ -144,6 +172,7 @@ class CameraController(private val context: Context) {
         if (!usb.hasPermission(device)) {
             setPhase(Phase.AwaitingPermission, "")
             val intent = Intent(ACTION_PERMISSION).setPackage(context.packageName)
+            permissionFor = device.deviceName
             usb.requestPermission(device, PendingIntent.getBroadcast(context, 0, intent, PendingIntent.FLAG_MUTABLE))
             return
         }
@@ -184,39 +213,84 @@ class CameraController(private val context: Context) {
         partial.deleteRecursively()
         check(partial.mkdirs()) { "cannot create $partial" }
         val before = usb.deviceList.values.firstOrNull(::isCamera)?.deviceName
-        NativeCamera.readCalibration(conn.fileDescriptor, partial)
-        dir.deleteRecursively()
-        check(partial.renameTo(dir)) { "cannot store the calibration in $dir" }
+        detachedSinceRestart = false
+        NativeCamera.readCalibration(conn.fileDescriptor, partial)  // validated, camera restarting
+        publish(partial, dir)
         connection = null
         conn.close()
+        // A session that ended during the read (activity stopped, camera
+        // unplugged) must not leave its expectation to a later, unrelated connect.
+        if (session != id) return
         restartedSensor = sensor
         main.post { if (session == id) setPhase(Phase.Restarting, "") }
-        val back = waitForCamera(before)
-        Log.i(TAG, "camera back after restart: $back")
+        val started = SystemClock.uptimeMillis()
+        val back = waitForCamera(before, id)
+        Log.i(TAG, "camera back after restart: $back (${SystemClock.uptimeMillis() - started} ms)")
         main.post {
-            if (session != id) return@post
-            if (back) {
-                setPhase(Phase.NoCamera, "")
-                connect()
-            } else {
-                // It still may: the system then reports it as attached and the app connects.
-                fail("The camera has not come back after restarting yet. If it does not, unplug it and plug it in again.")
-            }
+            if (session != id || back == null) return@post
+            setPhase(Phase.NoCamera, "")
+            connect()
         }
     }
 
     /**
-     * Worker: true once the camera has enumerated again after its restart,
-     * i.e. it is listed under a device name other than [before] (bounded).
+     * Replaces [dir] with [fresh] without ever losing a valid calibration: the
+     * old one is moved aside first and restored if [fresh] cannot be moved in.
      */
-    private fun waitForCamera(before: String?): Boolean {
-        val deadline = SystemClock.uptimeMillis() + RESTART_TIMEOUT_MS
-        while (SystemClock.uptimeMillis() < deadline) {
-            val now = usb.deviceList.values.firstOrNull(::isCamera)?.deviceName
-            if (now != null && now != before) return true
-            Thread.sleep(200)
+    private fun publish(fresh: File, dir: File) {
+        val old = File(dir.parentFile, dir.name + ".old")
+        old.deleteRecursively()
+        if (dir.exists()) check(dir.renameTo(old)) { "cannot move $dir aside" }
+        if (!fresh.renameTo(dir)) {
+            if (old.exists()) old.renameTo(dir)
+            error("cannot store the calibration in $dir")
         }
-        return false
+        old.deleteRecursively()
+    }
+
+    /**
+     * Worker: waits until the camera is back after its restart and returns its
+     * device name, or null if the session ended meanwhile (the activity
+     * stopped, the user went elsewhere).  There is no deadline: the camera
+     * returns when it returns; after [RESTART_SLOW_MS] the screen says how to help.
+     *
+     * Back means the camera answers and has finished starting up.  Enumeration
+     * events alone do not tell: normally the camera leaves the bus and comes
+     * back under a new device name, but in the emulator's USB passthrough the
+     * guest kept the old device (same name, no DETACHED) and qemu reattached
+     * the restarted camera to it, sometimes only minutes later (measured).  So
+     * a device that is listed is probed with a register read (on a fresh
+     * connection, if the app still has permission for it; after a new
+     * enumeration it usually has not, and connect() asks).
+     */
+    private fun waitForCamera(before: String?, id: Int): String? {
+        val started = SystemClock.uptimeMillis()
+        // The camera answers the reboot command and only then resets.
+        Thread.sleep(RESTART_MIN_MS)
+        var slowShown = false
+        while (session == id) {
+            val device = usb.deviceList.values.firstOrNull(::isCamera)
+            val renewed = device != null && (detachedSinceRestart || device.deviceName != before)
+            if (device == null) {
+                detachedSinceRestart = true
+            } else if (renewed && !usb.hasPermission(device)) {
+                return device.deviceName
+            } else if (usb.hasPermission(device)) {
+                val conn = usb.openDevice(device)
+                val sensor = conn?.let { c -> NativeCamera.probe(c.fileDescriptor).also { c.close() } }
+                Log.d(TAG, "restart wait: ${device.deviceName} (before $before, detached $detachedSinceRestart) answers: $sensor")
+                if (sensor != null) return device.deviceName
+            }
+            if (!slowShown && SystemClock.uptimeMillis() - started > RESTART_SLOW_MS) {
+                slowShown = true
+                main.post {
+                    if (session == id) setPhase(Phase.Restarting,
+                        "The camera is taking long to come back. If it does not, unplug it and plug it in again.")
+                }
+            }
+            synchronized(usbEvents) { usbEvents.wait(RESTART_POLL_MS) }
+        }
+        return null
     }
 
     /**
@@ -471,7 +545,9 @@ class CameraController(private val context: Context) {
         const val PRODUCT_ID = 0x1201
         const val PHOTO_FRAMES = 8
         const val PHOTO_SCALE = 4
-        private const val RESTART_TIMEOUT_MS = 20_000L
+        private const val RESTART_SLOW_MS = 20_000L
+        private const val RESTART_MIN_MS = 1_500L
+        private const val RESTART_POLL_MS = 500L
         private val BUSY_PHASES = setOf(Phase.ReadingCalibration, Phase.Restarting, Phase.Starting, Phase.Live)
     }
 }

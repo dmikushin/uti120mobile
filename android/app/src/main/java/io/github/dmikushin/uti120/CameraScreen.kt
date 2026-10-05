@@ -204,7 +204,7 @@ private fun Placeholder(c: CameraController) {
             Phase.NoCamera -> "Connect the UNI-T UTi120Mobile camera"
             Phase.AwaitingPermission -> "Allow access to the camera"
             Phase.ReadingCalibration -> "Reading the camera's calibration…\n(once per camera)"
-            Phase.Restarting -> "Restarting the camera…"
+            Phase.Restarting -> "Restarting the camera…" + if (c.message.isNotEmpty()) "\n" + c.message else ""
             Phase.Starting, Phase.Live -> "Calibrating the camera…"
             Phase.Failed -> c.message
         }

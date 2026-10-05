@@ -181,6 +181,21 @@ JNIEXPORT jstring JNICALL Java_io_github_dmikushin_uti120_NativeCamera_nativeSen
   }, static_cast<jstring>(nullptr));
 }
 
+// The sensor id if the camera behind `fd` answers and has finished starting
+// up (init status 1), else null.  Never throws: used to poll for the camera
+// after its restart.
+JNIEXPORT jstring JNICALL Java_io_github_dmikushin_uti120_NativeCamera_nativeProbe(
+    JNIEnv* env, jclass, jint fd) {
+  try {
+    Camera cam(open_usb_fd(fd));
+    DeviceInfo info = cam.info();
+    return info.init_status == 1 ? env->NewStringUTF(info.sensor.c_str()) : nullptr;
+  } catch (const std::exception& e) {
+    LOG_DEBUG("uti120.jni", "probe: %s", e.what());
+    return nullptr;
+  }
+}
+
 // Reads the camera's calibration into `dir` and reboots the camera: after a
 // flash read the firmware delivers no frames until it restarts.  The camera
 // then leaves the bus and comes back as a new device; the caller closes `fd`.
@@ -271,8 +286,8 @@ JNIEXPORT void JNICALL Java_io_github_dmikushin_uti120_NativeCamera_nativeSetVie
 }
 
 JNIEXPORT void JNICALL Java_io_github_dmikushin_uti120_NativeCamera_nativeRecalibrate(
-    JNIEnv*, jclass, jlong h) {
-  from_handle(h)->request_recalibration();
+    JNIEnv* env, jclass, jlong h) {
+  guarded(env, [&] { from_handle(h)->request_recalibration(); return 0; }, 0);
 }
 
 // Cumulative frame timing of the camera, see uti120::GrabStats:

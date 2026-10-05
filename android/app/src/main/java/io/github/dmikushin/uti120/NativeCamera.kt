@@ -136,9 +136,10 @@ class NativeCamera private constructor(
 
     /** Stops capturing and returns the camera to idle. */
     override fun close() {
-        if (handle != 0L) {
-            nativeClose(handle)
-            handle = 0L
+        // Atomic take: a second close (from another thread) sees 0 and does nothing.
+        val h = synchronized(this) { handle.also { handle = 0L } }
+        if (h != 0L) {
+            nativeClose(h)
         }
     }
 
@@ -156,6 +157,9 @@ class NativeCamera private constructor(
 
         /** The sensor id of the camera behind [fd]; names its calibration cache. */
         fun sensorId(fd: Int): String = nativeSensorId(fd)
+
+        /** The sensor id if the camera answers and has finished starting up, else null. */
+        fun probe(fd: Int): String? = nativeProbe(fd)
 
         /**
          * Reads the camera's calibration into [dir] and restarts the camera: the
@@ -178,6 +182,7 @@ class NativeCamera private constructor(
             handle: Long, emissivity: Float, reflected: Float, distance: Float, highRange: Boolean,
         )
         @JvmStatic private external fun nativeSensorId(fd: Int): String
+        @JvmStatic private external fun nativeProbe(fd: Int): String?
         @JvmStatic private external fun nativeCheckCalibration(dir: String, sensor: String): String?
         @JvmStatic private external fun nativeReadCalibration(fd: Int, dir: String)
         @JvmStatic private external fun nativeSetView(
