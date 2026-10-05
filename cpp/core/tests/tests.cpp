@@ -227,6 +227,30 @@ TEST(test_renderer_orientation) {
   CHECK(throws<std::invalid_argument>([&] { render({"ironbow", false, false, 45}); }, "rotation"));
 }
 
+// The vendor app's portrait view, measured by running CInfraredCore::Rotation
+// (core type 2, what the app selects) from its libguide_sdk_unitrend.so on an
+// image whose pixels hold their own index: the output corners top-left,
+// top-right, bottom-left, bottom-right show sensor pixels (119,0), (119,89),
+// (0,0), (0,89).  Rotation 270 must reproduce that.
+TEST(test_rotation_270_matches_vendor_portrait) {
+  Plane s(PIXELS);
+  for (int i = 0; i < PIXELS; ++i) s[i] = float(i);
+  Renderer r({"grey", false, false, 270});
+  // Grey palette with identity-like gain is monotonic; compare orders of
+  // sensor indices instead of exact values.
+  RgbImage img = r(s);
+  CHECK(img.width == HEIGHT && img.height == WIDTH);
+  auto lum = [&](int x, int y) { return img.rgb[3 * (y * img.width + x)]; };
+  auto expected = [](int sx, int sy) { return sy * WIDTH + sx; };
+  // Sensor index order of the four corners must match the vendor mapping.
+  int tl = expected(119, 0), tr = expected(119, 89), bl = expected(0, 0), br = expected(0, 89);
+  CHECK((lum(0, 0) < lum(HEIGHT - 1, 0)) == (tl < tr));
+  CHECK((lum(0, WIDTH - 1) < lum(HEIGHT - 1, WIDTH - 1)) == (bl < br));
+  CHECK((lum(0, 0) < lum(0, WIDTH - 1)) == (tl < bl));
+  CHECK(lum(0, WIDTH - 1) == 0);      // sensor (0,0), the smallest index, is bottom-left
+  CHECK(lum(HEIGHT - 1, 0) == 255);   // sensor (119,89), the largest, is top-right
+}
+
 TEST(test_header) {
   auto closed = parse_all("closed16.bin.gz"), opened = parse_all("open4.bin.gz");
   for (auto& f : closed) CHECK(f.shutter_closed());

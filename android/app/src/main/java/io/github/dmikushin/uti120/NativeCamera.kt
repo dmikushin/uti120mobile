@@ -8,8 +8,13 @@ data class ViewSettings(
     val palette: String = "ironbow",
     val mirror: Boolean = false,
     val flip: Boolean = false,
-    /** Clockwise, degrees. The vendor app shows the camera as a 3:4 portrait image. */
-    val rotation: Int = 90,
+    /**
+     * Clockwise, degrees.  270 is the vendor app's portrait orientation (camera
+     * in the phone's bottom port): it calls its native core with rotation type 3,
+     * which turns the sensor's right edge to the top, measured by running
+     * CInfraredCore::Rotation from its libguide_sdk_unitrend.so on a test image.
+     */
+    val rotation: Int = 270,
 )
 
 data class CameraSettings(
