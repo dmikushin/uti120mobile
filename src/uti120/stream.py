@@ -23,12 +23,15 @@ class Image:
     frame: Frame
     signal: np.ndarray  # float32[90, 120], offset-corrected counts
     timestamp: float
+    measurable: bool = False  # the radiometer can give temperatures for this frame
 
 
 class Stream:
     def __init__(self, cam: Camera, dark_frames: int = 16,
-                 recalibrate_s: float = 0.0, raw_sink=None):
+                 recalibrate_s: float = 0.0, raw_sink=None, radiometer=None):
         self.cam = cam
+        self.radiometer = radiometer  # fed every frame, shutter frames included
+        self.measurable = False
         self.dark_frames = dark_frames
         self.recalibrate_s = recalibrate_s
         self.raw_sink = raw_sink
@@ -39,6 +42,8 @@ class Stream:
         f = self.cam.grab()
         if self.raw_sink is not None:
             self.raw_sink.write(f.words.tobytes())
+        if self.radiometer is not None:
+            self.measurable = self.radiometer.feed(f.words.tobytes())
         return f
 
     def start(self):
@@ -93,7 +98,7 @@ class Stream:
         if self.recalibrate_s and time.monotonic() - self.calibrated_at > self.recalibrate_s:
             self.calibrate()
         f = self._grab()
-        return Image(f, self.calibration.apply(f.pixels), time.time())
+        return Image(f, self.calibration.apply(f.pixels), time.time(), self.measurable)
 
     def stop(self):
         try:

@@ -1,6 +1,7 @@
 """Command line interface: uti120 {info,snapshot,record,live}."""
 
 import argparse
+import contextlib
 import logging
 import shutil
 import subprocess
@@ -11,7 +12,7 @@ import time
 import numpy as np
 from PIL import Image as PILImage
 
-from . import palette
+from . import palette, radiometry
 from .device import Camera
 from .frame import HEIGHT, WIDTH
 from .process import AutoGain
@@ -34,10 +35,21 @@ def render(signal: np.ndarray, gain: AutoGain, args) -> np.ndarray:
 
 def open_stream(args, raw_sink=None) -> Stream:
     cam = Camera()
+    radiometer = None
+    if getattr(args, "celsius", False):
+        calibration, cam = radiometry.calibrated_camera(cam)
+        radiometer = radiometry.Radiometer(calibration, radiometry.Settings(
+            args.emissivity, args.reflected, args.distance, args.high_range))
     s = Stream(cam, dark_frames=args.dark_frames,
-               recalibrate_s=args.recalibrate, raw_sink=raw_sink)
+               recalibrate_s=args.recalibrate, raw_sink=raw_sink, radiometer=radiometer)
     s.start()
     return s
+
+
+def summary(t: np.ndarray) -> dict:
+    """min / max / mean / centre of a temperature map in sensor orientation."""
+    return {"min": float(t.min()), "max": float(t.max()), "mean": float(t.mean()),
+            "centre": float(t[HEIGHT // 2, WIDTH // 2])}
 
 
 def cmd_info(args):
@@ -48,16 +60,27 @@ def cmd_info(args):
 
 def cmd_snapshot(args):
     s = open_stream(args)
+    temps = []
     try:
-        images = [s.read() for _ in range(args.average)]
+        images = []
+        while len(images) < args.average:
+            im = s.read()
+            images.append(im)
+            if args.celsius and im.measurable:
+                temps.append(s.radiometer.temperatures())
     finally:
         s.stop()
+    if args.celsius:
+        t = np.mean(temps, axis=0)
+        print("temperature: " + ", ".join(f"{k} {v:.1f} C" for k, v in summary(t).items()))
+        if args.npy:
+            np.save(args.npy, t.astype(np.float32))
     signal = np.mean([im.signal for im in images], axis=0)
     rgb = render(signal, AutoGain(), args)
     out = PILImage.fromarray(rgb).resize((WIDTH * args.scale, HEIGHT * args.scale),
                                          PILImage.BICUBIC)
     out.save(args.output)
-    if args.npy:
+    if args.npy and not args.celsius:
         np.save(args.npy, signal)
     print(f"{args.output}: {images[-1].frame.describe()}, "
           f"signal p1/p50/p99 = {np.percentile(signal, [1, 50, 99]).round(1).tolist()}")
@@ -165,6 +188,34 @@ def pump(args, sink_cmd: list[str], duration: float):
     return rc
 
 
+def cmd_log(args):
+    """Temperatures over time, one CSV row per interval: for watching a GPU under load."""
+    args.celsius = True
+    s = open_stream(args)
+    with (open(args.output, "w") if args.output != "-" else contextlib.nullcontext(sys.stdout)) as out:
+        try:
+            log_rows(args, s, out)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            s.stop()
+
+
+def log_rows(args, s: Stream, out):
+    out.write("time_s,min_c,max_c,mean_c,centre_c,camera_fpa_c\n")
+    t0 = time.monotonic()
+    next_at = t0
+    while not args.duration or time.monotonic() - t0 < args.duration:
+        im = s.read()
+        if not im.measurable or time.monotonic() < next_at:
+            continue
+        row = summary(s.radiometer.temperatures())
+        out.write(f"{time.monotonic() - t0:.2f},{row['min']:.2f},{row['max']:.2f},"
+                  f"{row['mean']:.2f},{row['centre']:.2f},{im.frame.fpa_temp:.2f}\n")
+        out.flush()
+        next_at += args.interval
+
+
 def require(tool: str):
     if shutil.which(tool) is None:
         sys.exit(f"{tool} not found in PATH")
@@ -197,11 +248,29 @@ def main(argv=None):
     common.add_argument("--recalibrate", type=float, default=0.0, metavar="SECONDS",
                         help="repeat the shutter calibration this often (0 = never)")
 
-    sp = sub.add_parser("snapshot", parents=[common], help="save one image")
+    measure = argparse.ArgumentParser(add_help=False)
+    measure.add_argument("--emissivity", type=float, default=0.95, help="of the target (default 0.95)")
+    measure.add_argument("--distance", type=float, default=0.6, help="to the target in metres (default 0.6)")
+    measure.add_argument("--reflected", type=float, default=23.0,
+                         help="reflected (ambient) temperature in C (default 23)")
+    measure.add_argument("--high-range", action="store_true",
+                         help="use the high measuring range (above ~120 C)")
+
+    sp = sub.add_parser("snapshot", parents=[common, measure], help="save one image")
     sp.add_argument("-o", "--output", default="uti120.png")
     sp.add_argument("--average", type=int, default=8, help="frames averaged into the image")
-    sp.add_argument("--npy", help="also save the offset-corrected signal as .npy")
+    sp.add_argument("--celsius", action="store_true",
+                    help="also measure temperatures (the first time, reads and caches the "
+                         "camera's calibration, which restarts the camera)")
+    sp.add_argument("--npy", help="also save the signal (with --celsius: temperatures in C) as .npy")
     sp.set_defaults(func=cmd_snapshot)
+
+    sp = sub.add_parser("log", parents=[common, measure],
+                        help="log min/max/mean/centre temperatures over time as CSV")
+    sp.add_argument("-o", "--output", default="-", help="CSV file (default: standard output)")
+    sp.add_argument("-t", "--duration", type=float, default=0.0, help="seconds (0 = until interrupted)")
+    sp.add_argument("--interval", type=float, default=1.0, help="seconds between rows (default 1)")
+    sp.set_defaults(func=cmd_log)
 
     for name, func, helptext in (("record", cmd_record, "record a video with ffmpeg"),
                                  ("live", cmd_live, "show live video with ffplay")):

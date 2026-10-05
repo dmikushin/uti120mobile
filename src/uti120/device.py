@@ -16,6 +16,7 @@ single byte 0x81 to the command endpoint and read 25600 bytes from bulk IN.
 """
 
 import logging
+import zlib
 
 import usb.core
 import usb.util
@@ -37,6 +38,7 @@ SYS_READ = 0x05
 SENSOR_WRITE = 0x0A
 SENSOR_READ = 0x0B
 REQUEST_FRAME = 0x81
+TRANSFER = 0x09  # flash upload: begin / block acknowledgement / end
 
 # System registers (SYS_READ / SYS_WRITE).
 REG_FACTORY_ID = 0x00
@@ -54,6 +56,12 @@ SREG_NUC = 0x04      # write 1 to trigger the on-camera offset calibration
 
 RUN_IDLE = 0
 RUN_STREAM = 2
+RUN_UPLOAD = 3
+
+# Calibration packages in the camera's flash: (address, register holding the length).
+CALIBRATION_LOW = (0x132000, 13)
+CALIBRATION_HIGH = (0x100000, 12)
+REG_CALIBRATION_COEFFICIENTS = 49  # 8 registers: k, b of four temperature bands, x10000
 
 CMD_TIMEOUT_MS = 300
 CHUNK = 4096
@@ -134,6 +142,55 @@ class Camera:
             "run_status": self.read_regs(SYS_READ, REG_RUN_STATUS)[0],
             "init_status": self.read_regs(SYS_READ, REG_INIT_STATUS)[0],
         }
+
+    def read_calibration_package(self, package) -> bytes:
+        """Reads a calibration package (CALIBRATION_LOW / _HIGH) from the camera's flash.
+
+        Protocol of the vendor's UploadThread_ParamPkg: every 4096-byte block is
+        acknowledged with its CRC-32 and the whole package with its CRC-32.
+        After any flash upload the camera stops delivering frames until it is
+        rebooted (measured; pausing or clearing the endpoint does not help), so
+        callers must reboot() and open the camera again before streaming.
+        """
+        address, length_reg = package
+        length = self.read_regs(SYS_READ, length_reg)[0]
+        if not 0 < length <= 16 * 1024 * 1024:
+            raise DeviceError(f"implausible calibration package length {length}")
+
+        def transfer(offset, *values):
+            request = bytes([TRANSFER, offset, len(values)]) + b"".join(v.to_bytes(4, "big") for v in values)
+            reply = self._transact(request)
+            if reply[:3] != request[:3]:
+                raise DeviceError(f"bad reply to transfer command {request.hex()}: {reply.hex()}")
+
+        self._drain_bulk()
+        self.set_run_status(RUN_IDLE)
+        self.set_run_status(RUN_UPLOAD)
+        transfer(0, address, length)
+        data = bytearray()
+        while len(data) < length:
+            try:
+                block = bytes(self.dev.read(EP_BULK_IN, CHUNK, 1000))
+            except usb.core.USBTimeoutError:
+                raise DeviceError(f"calibration upload stalled after {len(data)} bytes") from None
+            transfer(2, zlib.crc32(block), len(block))
+            data += block
+        if len(data) != length:
+            raise DeviceError(f"calibration upload: got {len(data)} bytes, expected {length}")
+        transfer(4, zlib.crc32(data))
+        self.set_run_status(RUN_IDLE)
+        return bytes(data)
+
+    def read_calibration_coefficients(self) -> list:
+        return [int.from_bytes(v.to_bytes(4, "big"), "big", signed=True)
+                for v in self.read_regs(SYS_READ, REG_CALIBRATION_COEFFICIENTS, 8)]
+
+    def reboot(self):
+        """Restarts the camera; it re-enumerates on USB after about two seconds."""
+        try:
+            self.write_reg(SYS_WRITE, REG_REBOOT, 1)
+        except DeviceError:
+            pass  # the camera may go away before it answers
 
     def set_run_status(self, status: int):
         self.write_reg(SYS_WRITE, REG_RUN_STATUS, status)
