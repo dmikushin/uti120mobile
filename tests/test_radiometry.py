@@ -16,8 +16,13 @@ import pytest
 
 from uti120 import vendor_temp, vendor_y16
 from uti120.frame import FRAME_BYTES
-from uti120.radiometry import (CameraCalibration, Radiometer, Settings, WrongCamera,
-                               band_correction)
+from uti120.radiometry import (
+    CameraCalibration,
+    Radiometer,
+    Settings,
+    WrongCamera,
+    band_correction,
+)
 
 DATA = Path(__file__).parent / "data" / "radiometry"
 CASES = {"low": (False, 0.95, 0.6), "high": (True, 0.90, 1.0)}

@@ -13,7 +13,7 @@ import numpy as np
 from PIL import Image as PILImage
 
 from . import palette, radiometry
-from .device import Camera
+from .device import Camera, CameraStuck
 from .frame import HEIGHT, WIDTH
 from .process import AutoGain
 from .stream import Stream
@@ -42,7 +42,16 @@ def open_stream(args, raw_sink=None) -> Stream:
             args.emissivity, args.reflected, args.distance, args.high_range))
     s = Stream(cam, dark_frames=args.dark_frames,
                recalibrate_s=args.recalibrate, raw_sink=raw_sink, radiometer=radiometer)
-    s.start()
+    try:
+        s.start()
+    except CameraStuck as e:
+        # Stream.start() returned the camera to idle and released it.
+        log.warning("%s; restarting the camera", e)
+        c = Camera()
+        cam = radiometry.restart(c, c.info()["sensor"])
+        s = Stream(cam, dark_frames=args.dark_frames,
+                   recalibrate_s=args.recalibrate, raw_sink=raw_sink, radiometer=radiometer)
+        s.start()
     return s
 
 

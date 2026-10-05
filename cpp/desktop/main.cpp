@@ -201,15 +201,64 @@ std::string calibration_cache(const std::string& sensor) {
   return base + "/uti120/" + sensor;
 }
 
+// Reboots the camera and waits until it is back: first until the old device
+// has left the bus (it keeps answering, in its old state, for about 1.0 s after
+// the command), then until the new one reports init_status 1 (about 3.3 s);
+// it must be the same sensor.  Measured timings: see usb_camera_address().
+void reboot_and_wait(Camera& cam, const std::string& expected) {
+  int old_address = usb_camera_address();
+  cam.reboot();
+  double deadline = monotonic_s() + 10;
+  while (usb_camera_address() == old_address) {
+    if (monotonic_s() > deadline) fail("the camera did not restart");
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  for (deadline = monotonic_s() + 15;;) {
+    try {
+      DeviceInfo info = Camera(open_usb()).info();
+      if (info.init_status == 1) {
+        if (info.sensor != expected)
+          throw WrongCamera("after the restart a different camera answered (" + info.sensor +
+                            ", expected " + expected + ")");
+        return;
+      }
+    } catch (const WrongCamera&) {
+      throw;
+    } catch (const DeviceError& e) {
+      if (monotonic_s() > deadline) fail(std::string("camera did not come back after restart: ") + e.what());
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+}
+
+// Restarts a camera that is stuck (CameraStuck).
+void restart_camera(const char* why) {
+  Camera cam(open_usb());
+  std::string sensor = cam.info().sensor;
+  std::fprintf(stderr, "uti120: %s; restarting the camera\n", why);
+  reboot_and_wait(cam, sensor);
+}
+
+// Runs `f`; if the camera turns out to be silent, restarts it and runs `f` once more.
+template <class F>
+auto with_restart(F&& f) -> decltype(f()) {
+  try {
+    return f();
+  } catch (const CameraStuck& e) {
+    restart_camera(e.what());
+    return f();
+  }
+}
+
 // The camera's calibration for temperatures: read from the camera once and
 // cached per sensor (same files as the Python tool).  Reading it stops the
 // camera's frame stream until it is rebooted, so the camera is then rebooted
 // and this returns once it is back.
 CameraCalibration camera_calibration() {
-  std::string dir, expected;
+  std::string dir, sensor;
   {
     Camera cam(open_usb());
-    std::string sensor = expected = cam.info().sensor;
+    sensor = cam.info().sensor;
     dir = calibration_cache(sensor);
     if (std::filesystem::exists(dir + "/coefficients.json")) {
       LOG_INFO("uti120", "calibration from %s", dir.c_str());
@@ -217,35 +266,18 @@ CameraCalibration camera_calibration() {
       cal.validate(sensor);
       return cal;
     }
-    std::fprintf(stderr, "uti120: reading the camera's calibration (once; cached in %s)\n", dir.c_str());
-    CameraCalibration cal = read_camera_calibration(cam);
-    std::filesystem::create_directories(dir);
-    cal.save(dir);
-    try {
-      cam.write_reg(SYS_WRITE, REG_REBOOT, 1);
-    } catch (const DeviceError&) {
-      // the camera may go away before it answers
-    }
-  }  // released before the camera re-enumerates
-  // Wait for the camera to come back on the bus and finish its start-up.
-  std::this_thread::sleep_for(std::chrono::seconds(1));
-  for (double deadline = monotonic_s() + 15;;) {
-    try {
-      DeviceInfo info = Camera(open_usb()).info();
-      if (info.init_status == 1) {
-        if (info.sensor != expected)
-          throw WrongCamera("after the restart a different camera answered (" + info.sensor +
-                            ", expected " + expected + ")");
-        break;
-      }
-    } catch (const WrongCamera&) {
-      throw;
-    } catch (const DeviceError& e) {
-      if (monotonic_s() > deadline) fail(std::string("camera did not come back after reboot: ") + e.what());
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
   }
-  return CameraCalibration::load(dir);
+  std::fprintf(stderr, "uti120: reading the camera's calibration (once; cached in %s)\n", dir.c_str());
+  CameraCalibration cal = with_restart([&] {
+    Camera cam(open_usb());
+    CameraCalibration c = read_camera_calibration(cam);
+    // The firmware sends no frames after an upload until it is restarted.
+    reboot_and_wait(cam, sensor);
+    return c;
+  });
+  std::filesystem::create_directories(dir);
+  cal.save(dir);
+  return cal;
 }
 
 std::unique_ptr<Pipeline> start_pipeline(const Options& o, std::FILE* raw) {
@@ -258,9 +290,11 @@ std::unique_ptr<Pipeline> start_pipeline(const Options& o, std::FILE* raw) {
     settings.calibration = camera_calibration();
     settings.radiometry = o.radiometry;
   }
-  auto p = std::make_unique<Pipeline>(open_usb(), settings, view);
-  p->start();
-  return p;
+  return with_restart([&] {
+    auto p = std::make_unique<Pipeline>(open_usb(), settings, view);
+    p->start();
+    return p;
+  });
 }
 
 struct Summary {

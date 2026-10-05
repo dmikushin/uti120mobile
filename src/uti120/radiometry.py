@@ -27,9 +27,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+import usb.core
 
 from . import vendor_temp, vendor_y16
-from .device import CALIBRATION_HIGH, CALIBRATION_LOW, Camera, DeviceError
+from .device import (
+    CALIBRATION_HIGH,
+    CALIBRATION_LOW,
+    PID,
+    VID,
+    Camera,
+    CameraStuck,
+    DeviceError,
+)
 
 log = logging.getLogger(__name__)
 
@@ -94,20 +103,46 @@ def calibrated_camera(cam: Camera, cache: Path | None = None):
         cal.validate(sensor)
         return cal, cam
     log.info("reading the calibration of camera %s (once; it is cached in %s)", sensor, directory)
-    cal = CameraCalibration(cam.read_calibration_package(CALIBRATION_LOW),
-                            cam.read_calibration_package(CALIBRATION_HIGH),
-                            cam.read_calibration_coefficients())
+
+    def read(cam):
+        return CameraCalibration(cam.read_calibration_package(CALIBRATION_LOW),
+                                 cam.read_calibration_package(CALIBRATION_HIGH),
+                                 cam.read_calibration_coefficients())
+    try:
+        cal = read(cam)
+    except CameraStuck as e:
+        log.warning("%s; restarting the camera", e)
+        cam = restart(cam, sensor)
+        cal = read(cam)
     cal.validate(sensor)
     cal.save(directory)
+    # The firmware sends no frames after an upload until it is restarted.
+    return cal, restart(cam, sensor)
+
+
+def usb_address():
+    """(bus, address) of the camera, or None.  A reboot changes the address."""
+    d = usb.core.find(idVendor=VID, idProduct=PID)
+    return None if d is None else (d.bus, d.address)
+
+
+def restart(cam: Camera, sensor: str) -> Camera:
+    """Reboots the camera and returns it opened again, once it is back.
+
+    Measured (10 reboots): the old device keeps answering, in its old state,
+    for about 1.0 s after the reboot command before it leaves the bus; the new
+    one reports init_status 1 about 3.3 s after the command.  So first wait
+    for the address to change, then for init_status.
+    """
+    old = usb_address()
     cam.reboot()
     cam.close()
-    return cal, _reopen(sensor)
-
-
-def _reopen(sensor: str, timeout: float = 15.0) -> Camera:
-    """Opens the camera after a reboot, once it has enumerated again."""
-    deadline = time.monotonic() + timeout
-    time.sleep(1.0)  # it disappears from the bus first
+    deadline = time.monotonic() + 10
+    while usb_address() == old:
+        if time.monotonic() > deadline:
+            raise DeviceError("the camera did not restart")
+        time.sleep(0.05)
+    deadline = time.monotonic() + 15
     while True:
         try:
             cam = Camera()
@@ -123,8 +158,8 @@ def _reopen(sensor: str, timeout: float = 15.0) -> Camera:
             raise
         except (DeviceError, OSError) as e:
             if time.monotonic() > deadline:
-                raise DeviceError(f"camera did not come back after reboot: {e}") from None
-        time.sleep(0.3)
+                raise DeviceError(f"camera did not come back after restart: {e}") from None
+        time.sleep(0.1)
 
 
 @dataclass

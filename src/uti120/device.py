@@ -74,6 +74,13 @@ class DeviceError(RuntimeError):
     pass
 
 
+class CameraStuck(DeviceError):
+    """The camera is in a state only a reboot ends: it answers commands but
+    sends no data (measured cause: a calibration upload not followed by a
+    reboot), or a calibration upload starts with data that is not the package.
+    Recover with reboot(), waiting for the camera to come back, and one retry."""
+
+
 class Camera:
     def __init__(self):
         dev = usb.core.find(idVendor=VID, idProduct=PID)
@@ -163,12 +170,16 @@ class Camera:
             if reply[:3] != request[:3]:
                 raise DeviceError(f"bad reply to transfer command {request.hex()}: {reply.hex()}")
 
-        # Stop the camera first, then discard whatever is still in flight (the
-        # rest of a frame of an interrupted stream), so nothing stale precedes the package.
+        # Stop the camera first, then discard whatever is still in flight, with
+        # short reads only.  Measured: after a completed upload, a 100 ms bulk
+        # read in idle makes the next upload stall with no data until a
+        # reboot, a 10 ms one does not; and a frame requested but not read
+        # before going idle is not delivered to 10 ms reads, the package then
+        # arrives intact (3/3 each).
         self.set_run_status(RUN_IDLE)
         while True:
             try:
-                stale = self.dev.read(EP_BULK_IN, CHUNK, 100)
+                stale = self.dev.read(EP_BULK_IN, CHUNK, DRAIN_TIMEOUT_MS)
                 log.debug("discarded %d stale bulk bytes before the upload", len(stale))
             except usb.core.USBTimeoutError:
                 break
@@ -179,10 +190,12 @@ class Camera:
             try:
                 block = bytes(self.dev.read(EP_BULK_IN, CHUNK, 1000))
             except usb.core.USBTimeoutError:
+                if not data:
+                    raise CameraStuck("calibration upload: the camera sent no data; it needs a restart") from None
                 raise DeviceError(f"calibration upload stalled after {len(data)} bytes") from None
             # Every package starts with its header length (0xd8) and "TI_CAL_METHOD".
             if not data and not block.startswith(b"\xd8\x00\x00\x00TI_CAL"):
-                raise DeviceError(f"calibration upload: the first {len(block)} bytes are not a "
+                raise CameraStuck(f"calibration upload: the first {len(block)} bytes are not a "
                                   f"calibration package (stale data from an interrupted stream?): "
                                   f"{block[:16].hex()}")
             transfer(2, zlib.crc32(block), len(block))
@@ -232,6 +245,7 @@ class Camera:
         # The first chunk normally arrives ~8 ms after the request; an ignored
         # request is detected by a short timeout and simply repeated.
         buf = bytearray(self.dev.read(EP_BULK_IN, CHUNK, FIRST_CHUNK_TIMEOUT_MS))
+        self._received_data = True
         while len(buf) < FRAME_BYTES:
             buf += bytes(self.dev.read(EP_BULK_IN, CHUNK, CHUNK_TIMEOUT_MS))
         return bytes(buf)
@@ -243,6 +257,7 @@ class Camera:
         commands, the camera ignores frame requests for a short while; those
         requests time out and are repeated.
         """
+        self._received_data = False
         for attempt in range(retries):
             try:
                 f = Frame.parse(self._read_frame_once())
@@ -259,6 +274,8 @@ class Camera:
                 log.debug("frame request %d timed out", attempt)
             except FrameError as e:
                 log.warning("dropping frame: %s", e)
+        if not self._received_data:
+            raise CameraStuck(f"the camera sent no data for {retries} frame requests; it needs a restart")
         raise DeviceError(f"no valid frame after {retries} requests")
 
     def start(self):

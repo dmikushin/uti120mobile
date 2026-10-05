@@ -77,6 +77,17 @@ struct DeviceError : std::runtime_error {
   using std::runtime_error::runtime_error;
 };
 
+// The camera is in a state only a reboot ends: it answers commands but sends
+// no data at all (measured cause: a flash upload, read_calibration, not
+// followed by a reboot, e.g. because the process died in between), or a
+// calibration upload starts with data that is not the package (seen
+// intermittently after such recoveries; not reproduced on demand).  Callers
+// recover with reboot(), waiting for the camera to enumerate again, and one
+// retry.
+struct CameraStuck : DeviceError {
+  using DeviceError::DeviceError;
+};
+
 // Endpoint I/O.  Implemented over libusb for the real camera and by a script
 // in the tests.
 class Transport {
@@ -93,6 +104,12 @@ std::unique_ptr<Transport> open_usb();
 // Same for a device already opened by the platform (Android's
 // UsbDeviceConnection.getFileDescriptor()); the descriptor stays owned by the caller.
 std::unique_ptr<Transport> open_usb_fd(int fd);
+// Bus and address of the first 5656:1201 device as (bus << 8) | address, or
+// -1 if there is none.  A reboot changes the address: the old device leaves
+// the bus about 1.0 s after the reboot command and the new one reports
+// init_status 1 about 3.3 s after it (measured, 10 reboots).  Until the old
+// device is gone it still answers, in its old state.
+int usb_camera_address();
 
 // Where the time of delivered frames goes; cumulative since the camera was
 // opened.  Times are sums in milliseconds; divide by `frames`.
@@ -131,6 +148,9 @@ class Camera {
 
   void start();
   void stop() { set_run_status(RUN_IDLE); }
+  // Restarts the camera; it leaves the bus and enumerates again after about
+  // two seconds, so this object cannot be used afterwards.
+  void reboot();
 
   // Reads a calibration package from the camera's flash.  The camera must not
   // be streaming; it is left idle.  Every 4096-byte block is acknowledged with
@@ -150,6 +170,7 @@ class Camera {
   std::optional<std::vector<uint8_t>> read_frame_once();
 
   std::unique_ptr<Transport> transport_;
+  bool received_data_ = false;  // any bulk data during the current grab()
   mutable std::mutex stats_mutex_;
   GrabStats stats_;
 };

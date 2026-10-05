@@ -721,6 +721,29 @@ TEST(test_start_discards_frame_left_from_previous_session) {
   CHECK(cam.grab().frame_id() == opened[0].frame_id());
 }
 
+// A camera that sends nothing at all (the state a flash upload without a reboot
+// leaves it in) is told apart from one that sends broken frames.
+TEST(test_silent_camera_is_recognised) {
+  Camera silent = fake_camera();
+  CHECK(throws<CameraStuck>([&] { silent.grab(3); }, "needs a restart"));
+  auto frame = load("open4.bin.gz")[0];
+  Camera broken = fake_camera();
+  for (int k = 0; k < 3; ++k) {
+    g_fake->bulk.emplace_back(std::nullopt);  // drain
+    g_fake->bulk.emplace_back(std::vector<uint8_t>(frame.begin(), frame.begin() + 4096));
+    g_fake->bulk.emplace_back(std::nullopt);  // the rest never comes
+  }
+  bool silent_thrown = false, other_thrown = false;
+  try {
+    broken.grab(3);
+  } catch (const CameraStuck&) {
+    silent_thrown = true;
+  } catch (const DeviceError&) {
+    other_thrown = true;
+  }
+  CHECK(!silent_thrown && other_thrown);
+}
+
 TEST(test_grab_repeats_ignored_requests) {
   auto frame = load("open4.bin.gz")[0];
   Camera cam = fake_camera();
