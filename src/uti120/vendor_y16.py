@@ -195,6 +195,16 @@ class Y16Model:
     b: np.ndarray = field(default_factory=lambda: np.zeros(N, np.int16))
     gear: int = 0
 
+    def set_package(self, package: Package):
+        """Switches the measuring range (guideCoreSetMeasureMode).
+
+        The vendor core starts the next frame with K gear 0 again, as after
+        guideCoreInit, and keeps B; measured against the vendor library by
+        switching the range in the middle of a sequence.
+        """
+        self.package = package
+        self.gear = 0
+
     def gear_for(self, fpa: int) -> int:
         f = self.package.focus
         n = len(f)

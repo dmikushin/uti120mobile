@@ -42,6 +42,15 @@ struct CameraCalibration {
   // Python implementation, so both share a cache).  Throw std::runtime_error.
   void save(const std::string& dir) const;
   static CameraCalibration load(const std::string& dir);
+
+  // Throws DeviceError unless both packages parse and belong to `sensor` (each
+  // package carries the serial number of its camera); WrongCamera if they
+  // belong to another one.
+  void validate(const std::string& sensor) const;
+};
+
+struct WrongCamera : DeviceError {
+  using DeviceError::DeviceError;
 };
 
 // Reads the calibration from the camera and leaves it idle.
@@ -108,6 +117,8 @@ class Y16Model {
   std::vector<int16_t> process(const Frame& frame, const Package& package);
   // The state update of process() without computing the image.
   void skip(const Frame& frame, const Package& package);
+  // Measuring range switched (guideCoreSetMeasureMode): gear 0 as after init.
+  void reset_gear() { gear_ = 0; }
 
  private:
   void advance(const Frame& frame, const Package& package);
@@ -150,8 +161,10 @@ class Radiometer {
   // vendor app does not measure before its first shutter/NUC either).
   std::optional<Plane> feed(const Frame& frame);
 
-  // Takes effect from the next frame; B, the K gear and the drift history are kept.
-  void set_settings(const RadiometrySettings& settings) { settings_ = settings; }
+  // Takes effect from the next frame.  A range change behaves like the vendor's
+  // SetMeasureMode: B and the camera temperature history are kept, the K gear
+  // restarts at 0 (measured against the vendor library).
+  void set_settings(const RadiometrySettings& settings);
   const RadiometrySettings& settings() const { return settings_; }
 
  private:

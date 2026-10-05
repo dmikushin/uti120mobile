@@ -16,7 +16,8 @@ import pytest
 
 from uti120 import vendor_temp, vendor_y16
 from uti120.frame import FRAME_BYTES
-from uti120.radiometry import CameraCalibration, Radiometer, Settings, band_correction
+from uti120.radiometry import (CameraCalibration, Radiometer, Settings, WrongCamera,
+                               band_correction)
 
 DATA = Path(__file__).parent / "data" / "radiometry"
 CASES = {"low": (False, 0.95, 0.6), "high": (True, 0.90, 1.0)}
@@ -127,3 +128,43 @@ def test_temperature_sweep_matches_vendor_core(n):
         if words[12] == 0:
             rows.append([model.temperature(y, state) for y in case["y16"]])
     assert np.array_equal(np.array(rows, np.float32), want)
+
+
+def switch_frames(frames):
+    """The fixture frames with the sensor temperature set to 27.50 C, where the
+    low and high packages pick different gain tables."""
+    import struct
+    import zlib
+    out = []
+    for f in frames:
+        f = bytearray(f)
+        struct.pack_into("<h", f, 22, 2750)
+        struct.pack_into("<I", f, FRAME_BYTES - 4, zlib.crc32(bytes(f[:FRAME_BYTES - 4])))
+        out.append(bytes(f))
+    return out
+
+
+def test_range_switch_matches_vendor_core(frames):
+    """Low range, switched to the high range before frame 22 (vendor:
+    guideCoreSetMeasureMode(1)); goldens y16-switch / temp-switch are the
+    vendor core's output for the 4 open frames 20..23."""
+    cal = CameraCalibration(read("low.bin"), read("high.bin"), [10000, 0] * 4)
+    r = Radiometer(cal, Settings(emissivity=0.95, distance=0.6))
+    want_y16 = np.frombuffer(read("y16-switch.i16"), "<i2").reshape(-1, 120, 90)
+    want_t = np.frombuffer(read("temp-switch.f32"), "<f4").reshape(-1, 120, 90)
+    got_y16, got_t = [], []
+    for k, frame in enumerate(switch_frames(frames)):
+        if k == 22:
+            r.set_settings(Settings(emissivity=0.95, distance=0.6, high_range=True))
+        if r.feed(frame):
+            got_y16.append(np.rot90(r._y16, 1))
+            got_t.append(np.rot90(r.temperatures(), 1))
+    assert np.array_equal(np.array(got_y16), want_y16)
+    assert np.array_equal(np.array(got_t), want_t)
+
+
+def test_calibration_belongs_to_the_camera():
+    cal = CameraCalibration(read("low.bin"), read("high.bin"), [10000, 0] * 4)
+    cal.validate("GHH553111C713M279")
+    with pytest.raises(WrongCamera):
+        cal.validate("ANOTHER-SENSOR")

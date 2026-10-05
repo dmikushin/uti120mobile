@@ -381,6 +381,46 @@ TEST(test_radiometer_orientation_and_range) {
   CHECK(15 < *mn && *mx < 80);  // a running motherboard
 }
 
+// Low range, switched to the high range before frame 22 (the vendor's
+// guideCoreSetMeasureMode(1)), on the fixture frames with the sensor
+// temperature set to 27.50 C, where the two packages pick different gain
+// tables.  Goldens: the vendor core's Y16 and temperatures of frames 20..23.
+TEST(test_range_switch_matches_vendor_core) {
+  CameraCalibration cal;
+  cal.low = read_gz("low.bin.gz");
+  cal.high = read_gz("high.bin.gz");
+  cal.coefficients = {10000, 0, 10000, 0, 10000, 0, 10000, 0};
+  Radiometer r(cal, RadiometrySettings{0.95f, 23.0f, 0.6f, false});
+  auto want_t = radiometry_golden<float>("temp-switch.f32.gz");
+  auto frames = radiometry_frames("frames.raw.gz");
+  size_t k = 0;
+  bool same = true;
+  for (size_t n = 0; n < frames.size(); ++n) {
+    Frame f = frames[n];
+    f.words[HDR_FPA_TEMP] = 2750;
+    if (n == 22) r.set_settings(RadiometrySettings{0.95f, 23.0f, 0.6f, true});
+    auto t = r.feed(f);
+    if (!t) continue;
+    for (int i = 0; i < WIDTH; ++i)
+      for (int j = 0; j < HEIGHT; ++j)
+        same &= std::memcmp(&(*t)[j * WIDTH + (WIDTH - 1 - i)], &want_t[k * PIXELS + i * HEIGHT + j],
+                            sizeof(float)) == 0;
+    ++k;
+  }
+  CHECK(k == 4);
+  CHECK(same);
+}
+
+TEST(test_calibration_belongs_to_the_camera) {
+  CameraCalibration cal;
+  cal.low = read_gz("low.bin.gz");
+  cal.high = read_gz("high.bin.gz");
+  cal.validate("GHH553111C713M279");
+  CHECK(throws<WrongCamera>([&] { cal.validate("ANOTHER-SENSOR"); }, "for camera GHH553111C713M279"));
+  cal.low.resize(0x20);
+  CHECK(throws<DeviceError>([&] { cal.validate("GHH553111C713M279"); }, "unknown format"));
+}
+
 TEST(test_band_correction) {
   std::array<int32_t, 8> c = {9799, -5252, 10751, -9489, 10417, 18752, 10428, 22419};  // this camera
   auto near = [](float a, double b) { return std::abs(a - b) < 1e-4; };

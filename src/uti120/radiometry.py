@@ -32,10 +32,13 @@ from . import vendor_temp, vendor_y16
 from .device import CALIBRATION_HIGH, CALIBRATION_LOW, Camera, DeviceError
 
 log = logging.getLogger(__name__)
-PACKAGE_MAGIC = b"TI_CAL_METHOD"
 
-LOW_RANGE_MAX = 150.0  # the vendor app switches to the high range above this
-HIGH_RANGE_MIN = 120.0  # ... and back below this
+
+class WrongCamera(DeviceError):
+    """A calibration, or the camera after a restart, belongs to another sensor."""
+
+
+PACKAGE_MAGIC = b"TI_CAL_METHOD"
 
 
 @dataclass
@@ -45,6 +48,19 @@ class CameraCalibration:
     low: bytes                 # calibration package, low range (flash 0x132000)
     high: bytes                # calibration package, high range (flash 0x100000)
     coefficients: list         # system registers 49..56, k and b of four bands, x10000
+
+    def validate(self, sensor: str):
+        """Raises DeviceError unless both packages parse and belong to `sensor`
+        (each package carries the serial number of its camera)."""
+        for name, package in (("low", self.low), ("high", self.high)):
+            if PACKAGE_MAGIC not in package[:0x40]:
+                raise DeviceError(f"{name} calibration package has an unknown format")
+            serial = vendor_temp.Package.parse(package).serial
+            if serial != sensor:
+                raise WrongCamera(f"{name} calibration package is for camera {serial!r}, "
+                                  f"the connected camera is {sensor!r}")
+        if len(self.coefficients) != 8:
+            raise DeviceError("calibration coefficients: expected 8 values")
 
     def save(self, directory: Path):
         directory.mkdir(parents=True, exist_ok=True)
@@ -74,30 +90,37 @@ def calibrated_camera(cam: Camera, cache: Path | None = None):
     sensor = cam.info()["sensor"]
     directory = (cache or cache_dir()) / sensor
     if (directory / "coefficients.json").exists():
-        return CameraCalibration.load(directory), cam
+        cal = CameraCalibration.load(directory)
+        cal.validate(sensor)
+        return cal, cam
     log.info("reading the calibration of camera %s (once; it is cached in %s)", sensor, directory)
     cal = CameraCalibration(cam.read_calibration_package(CALIBRATION_LOW),
                             cam.read_calibration_package(CALIBRATION_HIGH),
                             cam.read_calibration_coefficients())
-    for name, package in (("low", cal.low), ("high", cal.high)):
-        if PACKAGE_MAGIC not in package[:0x40]:
-            raise DeviceError(f"{name} calibration package has an unknown format")
+    cal.validate(sensor)
     cal.save(directory)
     cam.reboot()
     cam.close()
-    return cal, _reopen()
+    return cal, _reopen(sensor)
 
 
-def _reopen(timeout: float = 15.0) -> Camera:
+def _reopen(sensor: str, timeout: float = 15.0) -> Camera:
     """Opens the camera after a reboot, once it has enumerated again."""
     deadline = time.monotonic() + timeout
     time.sleep(1.0)  # it disappears from the bus first
     while True:
         try:
             cam = Camera()
-            if cam.info()["init_status"] == 1:
+            info = cam.info()
+            if info["init_status"] == 1:
+                if info["sensor"] != sensor:
+                    cam.close()
+                    raise WrongCamera(f"after the restart a different camera answered "
+                                      f"({info['sensor']!r}, expected {sensor!r})")
                 return cam
             cam.close()
+        except WrongCamera:
+            raise
         except (DeviceError, OSError) as e:
             if time.monotonic() > deadline:
                 raise DeviceError(f"camera did not come back after reboot: {e}") from None
@@ -138,14 +161,26 @@ class Radiometer:
     settings: Settings = field(default_factory=Settings)
 
     def __post_init__(self):
-        package = self.calibration.high if self.settings.high_range else self.calibration.low
-        self.y16 = vendor_y16.Y16Model(vendor_y16.Package.parse(package))
-        self.model = vendor_temp.TemperatureModel(
-            vendor_temp.Package.parse(package),
-            vendor_temp.Settings(self.settings.emissivity, self.settings.reflected, self.settings.distance),
-            high=self.settings.high_range)
+        self.packages = {False: self.calibration.low, True: self.calibration.high}
+        self.y16 = vendor_y16.Y16Model(vendor_y16.Package.parse(self.packages[self.settings.high_range]))
         self.state = vendor_temp.State()
         self.have_reference = False
+        self._temperature_model()
+
+    def _temperature_model(self):
+        s = self.settings
+        self.model = vendor_temp.TemperatureModel(
+            vendor_temp.Package.parse(self.packages[s.high_range]),
+            vendor_temp.Settings(s.emissivity, s.reflected, s.distance), high=s.high_range)
+
+    def set_settings(self, settings: Settings):
+        """Takes effect from the next frame.  A range change behaves like the
+        vendor's SetMeasureMode: the shutter reference and the camera
+        temperature history are kept, the per-pixel gain table restarts at 0."""
+        if settings.high_range != self.settings.high_range:
+            self.y16.set_package(vendor_y16.Package.parse(self.packages[settings.high_range]))
+        self.settings = settings
+        self._temperature_model()
 
     def feed(self, frame: bytes) -> bool:
         """Processes the next frame; True if temperatures() can be asked for it.

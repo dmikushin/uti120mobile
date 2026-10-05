@@ -190,6 +190,11 @@ File open_raw(const Options& o) {
 }
 
 std::string calibration_cache(const std::string& sensor) {
+  // A sensor id names a directory; refuse anything that could escape it.
+  if (sensor.empty() || sensor.find_first_not_of(
+                            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_") !=
+                            std::string::npos)
+    fail("unexpected sensor id \"" + sensor + "\"");
   const char* xdg = std::getenv("XDG_CACHE_HOME");
   const char* home = std::getenv("HOME");
   std::string base = xdg && *xdg ? xdg : std::string(home ? home : ".") + "/.cache";
@@ -201,13 +206,16 @@ std::string calibration_cache(const std::string& sensor) {
 // camera's frame stream until it is rebooted, so the camera is then rebooted
 // and this returns once it is back.
 CameraCalibration camera_calibration() {
-  std::string dir;
+  std::string dir, expected;
   {
     Camera cam(open_usb());
-    dir = calibration_cache(cam.info().sensor);
+    std::string sensor = expected = cam.info().sensor;
+    dir = calibration_cache(sensor);
     if (std::filesystem::exists(dir + "/coefficients.json")) {
       LOG_INFO("uti120", "calibration from %s", dir.c_str());
-      return CameraCalibration::load(dir);
+      CameraCalibration cal = CameraCalibration::load(dir);
+      cal.validate(sensor);
+      return cal;
     }
     std::fprintf(stderr, "uti120: reading the camera's calibration (once; cached in %s)\n", dir.c_str());
     CameraCalibration cal = read_camera_calibration(cam);
@@ -223,7 +231,15 @@ CameraCalibration camera_calibration() {
   std::this_thread::sleep_for(std::chrono::seconds(1));
   for (double deadline = monotonic_s() + 15;;) {
     try {
-      if (Camera(open_usb()).info().init_status == 1) break;
+      DeviceInfo info = Camera(open_usb()).info();
+      if (info.init_status == 1) {
+        if (info.sensor != expected)
+          throw WrongCamera("after the restart a different camera answered (" + info.sensor +
+                            ", expected " + expected + ")");
+        break;
+      }
+    } catch (const WrongCamera&) {
+      throw;
     } catch (const DeviceError& e) {
       if (monotonic_s() > deadline) fail(std::string("camera did not come back after reboot: ") + e.what());
     }

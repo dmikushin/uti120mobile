@@ -83,7 +83,8 @@ class Pipeline {
   std::optional<Image> newest(std::chrono::milliseconds wait);
   // Mean signal of the next n captured images.
   // With radiometry, `temperature` (if given) receives the mean temperatures
-  // of the same images.
+  // of those of the n images that carry temperatures (all of them once the
+  // pipeline has started: the start-up shutter frames are the reference).
   Plane snapshot(int n, Frame* last = nullptr, Plane* temperature = nullptr);
   // The capture thread recalibrates on the shutter before its next frame.
   void request_recalibration() { recalibrate_ = true; }

@@ -515,19 +515,28 @@ CameraCalibration CameraCalibration::load(const std::string& dir) {
   return c;
 }
 
+void CameraCalibration::validate(const std::string& sensor) const {
+  static const char magic[] = "TI_CAL_METHOD";
+  for (const auto* pkg : {&low, &high}) {
+    const char* name = pkg == &low ? "low" : "high";
+    if (pkg->size() < 0x40 ||
+        std::search(pkg->begin(), pkg->begin() + 0x40, magic, magic + sizeof magic - 1) == pkg->begin() + 0x40)
+      throw DeviceError(std::string(name) + " calibration package has an unknown format");
+    std::string serial = vendor::Package::parse(*pkg).serial;
+    if (serial != sensor)
+      throw WrongCamera(std::string(name) + " calibration package is for camera " + serial +
+                        ", the connected camera is " + sensor);
+  }
+}
+
 CameraCalibration read_camera_calibration(Camera& cam) {
   CameraCalibration c;
   // Registers 49..56, one by one like the vendor (InitThread.initCalibrationInfo).
   for (int i = 0; i < 8; ++i) c.coefficients[i] = int32_t(cam.read_regs(SYS_READ, uint8_t(49 + i))[0]);
+  std::string sensor = cam.info().sensor;
   c.low = cam.read_calibration(CalibrationPackage::Low);
   c.high = cam.read_calibration(CalibrationPackage::High);
-  for (auto* pkg : {&c.low, &c.high}) {
-    static const char magic[] = "TI_CAL_METHOD";
-    if (pkg->size() < 0x40 ||
-        std::search(pkg->begin(), pkg->begin() + 0x40, magic, magic + sizeof magic - 1) == pkg->begin() + 0x40)
-      throw DeviceError("calibration package has an unknown format");
-    vendor::Package::parse(*pkg);  // validate before it is cached
-  }
+  c.validate(sensor);  // before it is cached
   return c;
 }
 
@@ -538,6 +547,11 @@ Radiometer::Radiometer(const CameraCalibration& c, const RadiometrySettings& set
       settings_(settings) {
   LOG_INFO(LOG, "calibration of sensor %s: %d FPA knots, curves %d..%d C", low_.serial.c_str(),
            low_.n_focus, low_.t_min, low_.t_max);
+}
+
+void Radiometer::set_settings(const RadiometrySettings& settings) {
+  if (settings.high_range != settings_.high_range) y16_.reset_gear();
+  settings_ = settings;
 }
 
 std::optional<Plane> Radiometer::feed(const Frame& frame) {

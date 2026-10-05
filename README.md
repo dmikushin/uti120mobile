@@ -107,7 +107,7 @@ The image is relative: brighter means warmer, scaled automatically between the
 ```sh
 uti120 snapshot --celsius -o board.png       # also prints min/max/mean/centre in C
 uti120 snapshot --celsius --npy board.npy    # ...and saves the 120x90 map in C
-uti120 live --celsius                        # min/max/centre in the window title
+uti120 live --celsius                        # min/max/centre in the window title (C++ tool)
 uti120 log -t 600 --interval 1 -o gpu.csv    # CSV time series: a GPU under load
 ```
 
