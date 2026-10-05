@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Dark window behind Compose, matching the vendor's #0e0e0e bars. -->
+    <style name="Theme.Uti120" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/bar</item>
+    </style>
+    <color name="bar">#FF0E0E0E</color>
+</resources>

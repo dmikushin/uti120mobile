@@ -23,6 +23,9 @@ target_include_directories(uti120core PUBLIC include)
 target_compile_options(uti120core PRIVATE -Wall -Wextra)
 target_link_libraries(uti120core PUBLIC ${UTI120_LIBUSB_TARGET} ${UTI120_ZLIB_TARGET}
                       Threads::Threads)
+if(ANDROID)
+  target_link_libraries(uti120core PUBLIC log)  # log.cpp writes to logcat
+endif()
 
 option(UTI120_BUILD_TESTS "Build the offline tests of the backend" ON)
 if(UTI120_BUILD_TESTS)

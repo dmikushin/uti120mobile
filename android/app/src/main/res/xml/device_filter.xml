@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- UNI-T UTi120Mobile, USB 5656:1201 -->
+    <usb-device vendor-id="22102" product-id="4609" />
+</resources>
