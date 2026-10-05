@@ -2,6 +2,7 @@
 
 #include <libusb.h>
 
+#include <chrono>
 #include <cstdio>
 
 #include "uti120/log.hpp"
@@ -178,23 +179,60 @@ void Camera::drain_bulk() {
     LOG_DEBUG(LOG, "discarded %zu stale bulk bytes", stale->size());
 }
 
+namespace {
+using Clock = std::chrono::steady_clock;
+double ms_between(Clock::time_point a, Clock::time_point b) {
+  return std::chrono::duration<double, std::milli>(b - a).count();
+}
+}  // namespace
+
+GrabStats Camera::stats() const {
+  std::lock_guard lock(stats_mutex_);
+  return stats_;
+}
+
 std::optional<std::vector<uint8_t>> Camera::read_frame_once() {
+  auto t0 = Clock::now();
   drain_bulk();
+  auto t1 = Clock::now();
   transport_->write(EP_CMD_OUT, {REQUEST_FRAME}, CMD_TIMEOUT_MS);
   // The first chunk normally arrives ~8 ms after the request; an ignored
   // request is detected by a short timeout and simply repeated.
   auto first = transport_->read(EP_BULK_IN, CHUNK, FIRST_CHUNK_TIMEOUT_MS);
-  if (!first) return std::nullopt;
+  auto t2 = Clock::now();
+  if (!first) {
+    std::lock_guard lock(stats_mutex_);
+    stats_.ignored++;
+    return std::nullopt;
+  }
   std::vector<uint8_t> buf = std::move(*first);
+  long reads = 1;
   while (buf.size() < FRAME_BYTES) {
     auto chunk = transport_->read(EP_BULK_IN, CHUNK, CHUNK_TIMEOUT_MS);
-    if (!chunk) return std::nullopt;
+    if (!chunk) {
+      std::lock_guard lock(stats_mutex_);
+      stats_.ignored++;
+      return std::nullopt;
+    }
+    ++reads;
     buf.insert(buf.end(), chunk->begin(), chunk->end());
   }
+  auto t3 = Clock::now();
+  std::lock_guard lock(stats_mutex_);
+  stats_.reads += reads;
+  stats_.drain_ms += ms_between(t0, t1);
+  stats_.first_ms += ms_between(t1, t2);
+  stats_.transfer_ms += ms_between(t2, t3);
   return buf;
 }
 
 Frame Camera::grab(int retries) {
+  auto start = Clock::now();
+  auto account = [&](bool delivered) {
+    std::lock_guard lock(stats_mutex_);
+    stats_.total_ms += ms_between(start, Clock::now());
+    if (delivered) stats_.frames++;
+  };
   for (int attempt = 0; attempt < retries; ++attempt) {
     auto data = read_frame_once();
     if (!data) {
@@ -210,15 +248,21 @@ Frame Camera::grab(int retries) {
         int d = (f.frame_id() - *last_frame_id) & 0xFFFF;
         if (!(0 < d && d < 0x8000)) {
           LOG_WARNING(LOG, "dropping stale frame %d (last %d)", f.frame_id(), *last_frame_id);
+          std::lock_guard lock(stats_mutex_);
+          stats_.dropped++;
           continue;
         }
       }
       last_frame_id = f.frame_id();
+      account(true);
       return f;
     } catch (const FrameError& e) {
       LOG_WARNING(LOG, "dropping frame: %s", e.what());
+      std::lock_guard lock(stats_mutex_);
+      stats_.dropped++;
     }
   }
+  account(false);
   throw DeviceError("no valid frame after " + std::to_string(retries) + " requests");
 }
 

@@ -16,8 +16,8 @@ android {
         // MediaStore relative paths (Pictures/UTi120, Movies/UTi120) need API 29.
         minSdk = 29
         targetSdk = 37
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 3
+        versionName = "0.1.2"
         ndk {
             // Phones, and the x86_64 emulator used for testing.
             abiFilters += listOf("arm64-v8a", "x86_64")

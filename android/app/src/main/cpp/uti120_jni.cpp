@@ -153,9 +153,19 @@ JNIEXPORT void JNICALL Java_io_github_dmikushin_uti120_NativeCamera_nativeRecali
   from_handle(h)->request_recalibration();
 }
 
-JNIEXPORT jlong JNICALL Java_io_github_dmikushin_uti120_NativeCamera_nativeFramesCaptured(
-    JNIEnv*, jclass, jlong h) {
-  return from_handle(h)->frames_captured();
+// Cumulative frame timing of the camera, see uti120::GrabStats:
+// {frames, ignored, dropped, reads, drain_ms, first_ms, transfer_ms, total_ms}.
+JNIEXPORT jdoubleArray JNICALL Java_io_github_dmikushin_uti120_NativeCamera_nativeStats(
+    JNIEnv* env, jclass, jlong h) {
+  return guarded(env, [&]() -> jdoubleArray {
+    GrabStats s = from_handle(h)->camera().stats();
+    jdouble v[8] = {double(s.frames), double(s.ignored), double(s.dropped), double(s.reads),
+                    s.drain_ms, s.first_ms, s.transfer_ms, s.total_ms};
+    jdoubleArray out = env->NewDoubleArray(8);
+    if (!out) throw std::runtime_error("out of memory");
+    env->SetDoubleArrayRegion(out, 0, 8, v);
+    return out;
+  }, static_cast<jdoubleArray>(nullptr));
 }
 
 JNIEXPORT jobjectArray JNICALL Java_io_github_dmikushin_uti120_NativeCamera_nativePaletteNames(

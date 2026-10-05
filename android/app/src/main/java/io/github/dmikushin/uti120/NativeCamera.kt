@@ -17,6 +17,28 @@ data class ViewSettings(
     val rotation: Int = 270,
 )
 
+/** uti120::GrabStats: where the time of camera frames goes (sums since opening). */
+data class GrabStats(
+    val frames: Double, val ignored: Double, val dropped: Double, val reads: Double,
+    val drainMs: Double, val firstMs: Double, val transferMs: Double, val totalMs: Double,
+) {
+    constructor(v: DoubleArray) : this(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7])
+
+    operator fun minus(o: GrabStats) = GrabStats(
+        frames - o.frames, ignored - o.ignored, dropped - o.dropped, reads - o.reads,
+        drainMs - o.drainMs, firstMs - o.firstMs, transferMs - o.transferMs, totalMs - o.totalMs,
+    )
+
+    /** Per-frame averages of an interval (a difference of two samples). */
+    fun describe(seconds: Double): String {
+        val n = frames.coerceAtLeast(1.0)
+        return "%.1f fps · per frame: drain %.1f, first read %.1f, transfer %.1f, total %.1f ms · %.1f reads · %d ignored, %d dropped".format(
+            frames / seconds, drainMs / n, firstMs / n, transferMs / n, totalMs / n, reads / n,
+            ignored.toInt(), dropped.toInt(),
+        )
+    }
+}
+
 data class CameraSettings(
     val darkFrames: Int = 16,
     /** Periodic shutter recalibration in seconds, 0 = never. */
@@ -55,7 +77,8 @@ class NativeCamera(fd: Int, settings: CameraSettings, view: ViewSettings) : Auto
 
     fun recalibrate() = nativeRecalibrate(h())
 
-    fun framesCaptured(): Long = nativeFramesCaptured(h())
+    /** Cumulative frame timing, see [GrabStats]. */
+    fun stats(): GrabStats = GrabStats(nativeStats(h()))
 
     /** Stops capturing and returns the camera to idle. */
     override fun close() {
@@ -87,7 +110,7 @@ class NativeCamera(fd: Int, settings: CameraSettings, view: ViewSettings) : Auto
             handle: Long, palette: String, mirror: Boolean, flip: Boolean, rotation: Int,
         )
         @JvmStatic private external fun nativeRecalibrate(handle: Long)
-        @JvmStatic private external fun nativeFramesCaptured(handle: Long): Long
+        @JvmStatic private external fun nativeStats(handle: Long): DoubleArray
         @JvmStatic private external fun nativePaletteNames(): Array<String>
         @JvmStatic private external fun nativePaletteColors(name: String): IntArray
     }

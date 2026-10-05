@@ -41,11 +41,18 @@ class CameraController(private val context: Context) {
         private set
     var fps by mutableStateOf(0.0)
         private set
+    /** Frame timing of the last second, shown when the fps label is tapped. */
+    var diagnostics by mutableStateOf("")
+        private set
     var calibrating by mutableStateOf(false)
         private set
     var recording by mutableStateOf(false)
         private set
-    var busy by mutableStateOf(false)
+    /** A photo is being taken (8 frames averaged and saved). */
+    var photoBusy by mutableStateOf(false)
+        private set
+    /** A recording is being started or finished. */
+    var videoBusy by mutableStateOf(false)
         private set
     var lastCapture by mutableStateOf<Uri?>(null)
         private set
@@ -172,15 +179,15 @@ class CameraController(private val context: Context) {
     }
 
     fun takePhoto() {
-        if (phase != Phase.Live || busy) return
-        busy = true
+        if (phase != Phase.Live || photoBusy) return
+        photoBusy = true
         worker.execute {
             val result = runCatching {
                 val shot = camera!!.snapshot(PHOTO_FRAMES)
                 Captures.savePhoto(context.contentResolver, shot, PHOTO_SCALE)
             }
             main.post {
-                busy = false
+                photoBusy = false
                 result.onSuccess { lastCapture = it; show("Photo saved to Pictures/UTi120") }
                     .onFailure { show("Photo failed: ${it.message}") }
             }
@@ -188,8 +195,8 @@ class CameraController(private val context: Context) {
     }
 
     fun toggleRecording() {
-        if (phase != Phase.Live || busy) return
-        busy = true
+        if (phase != Phase.Live || videoBusy) return
+        videoBusy = true
         worker.execute {
             val result = runCatching {
                 val active = synchronized(recorderLock) { recorder }
@@ -213,7 +220,7 @@ class CameraController(private val context: Context) {
             }
             val nowRecording = synchronized(recorderLock) { recorder != null }
             main.post {
-                busy = false
+                videoBusy = false
                 recording = nowRecording
                 result.onSuccess { uri -> uri?.let { lastCapture = it; show("Video saved to Movies/UTi120") } }
                     .onFailure { show("Video failed: ${it.message}") }
@@ -247,15 +254,20 @@ class CameraController(private val context: Context) {
         val period = 1000L / VideoRecorder.FPS
         var next = SystemClock.uptimeMillis()
         var statAt = next
-        var statFrames = cam.framesCaptured()
+        var stats = cam.stats()
+        var renderMs = 0.0
+        var renders = 0
         while (rendering) {
             try {
+                val started = SystemClock.elapsedRealtimeNanos()
                 val bitmap = cam.newBitmap()
                 if (cam.render(bitmap)) {
                     synchronized(recorderLock) { recorder?.write(bitmap) }
                     val shown = bitmap.asImageBitmap()
                     main.post { if (session == id) image = shown }
                 }
+                renderMs += (SystemClock.elapsedRealtimeNanos() - started) / 1e6
+                renders++
             } catch (e: Exception) {
                 Log.e(TAG, "rendering failed", e)
                 rendering = false
@@ -264,11 +276,21 @@ class CameraController(private val context: Context) {
             }
             val now = SystemClock.uptimeMillis()
             if (now - statAt >= 1000) {
-                val frames = cam.framesCaptured()
-                val rate = (frames - statFrames) * 1000.0 / (now - statAt)
-                main.post { if (session == id) fps = rate }
+                val current = cam.stats()
+                val interval = current - stats
+                val seconds = (now - statAt) / 1000.0
+                val text = interval.describe(seconds) + " · render %.1f ms".format(renderMs / renders.coerceAtLeast(1))
+                Log.i(TAG, text)
+                main.post {
+                    if (session == id) {
+                        fps = interval.frames / seconds
+                        diagnostics = text
+                    }
+                }
                 statAt = now
-                statFrames = frames
+                stats = current
+                renderMs = 0.0
+                renders = 0
             }
             next += period
             val delay = next - SystemClock.uptimeMillis()

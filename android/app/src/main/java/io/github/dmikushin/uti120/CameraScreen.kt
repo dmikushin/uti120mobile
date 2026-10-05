@@ -7,7 +7,6 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -15,6 +14,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -59,7 +59,6 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -74,15 +73,14 @@ private val PanelColor = Color(0xFF202020)    // panel under the image
 private val Muted = Color(0xFF8E898C)         // gray
 
 private enum class Tab { Orientation, Palettes, Settings }
-private enum class Mode { Photo, Video }
 
 @Composable
 fun CameraScreen(c: CameraController) {
     MaterialTheme(colorScheme = darkColorScheme()) {
         var tab by rememberSaveable { mutableStateOf<Tab?>(null) }
-        var mode by rememberSaveable { mutableStateOf(Mode.Photo) }
+        var diagnostics by rememberSaveable { mutableStateOf(false) }
         Column(Modifier.fillMaxSize().background(BarColor).systemBarsPadding()) {
-            Header(c)
+            Header(c) { diagnostics = !diagnostics }
             BoxWithConstraints(Modifier.weight(1f).fillMaxWidth().background(ContentColor)) {
                 // Image area as in the vendor's MainActivity: full width at 3:4,
                 // or the height left after 190 dp for the panel.
@@ -94,14 +92,14 @@ fun CameraScreen(c: CameraController) {
                 }
                 Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
                     Box(Modifier.width(w).height(h)) {
-                        ImageArea(c)
+                        ImageArea(c, diagnostics)
                         when (tab) {
                             Tab.Orientation -> OrientationBar(c, Modifier.align(Alignment.BottomCenter))
                             Tab.Palettes -> PaletteStrip(c, Modifier.align(Alignment.BottomCenter))
                             else -> {}
                         }
                     }
-                    CapturePanel(c, mode, { mode = it }, Modifier.weight(1f).fillMaxWidth())
+                    CapturePanel(c, Modifier.weight(1f).fillMaxWidth())
                 }
             }
             BottomBar(tab) { tab = if (tab == it) null else it }
@@ -111,7 +109,7 @@ fun CameraScreen(c: CameraController) {
 }
 
 @Composable
-private fun Header(c: CameraController) {
+private fun Header(c: CameraController, toggleDiagnostics: () -> Unit) {
     Row(
         Modifier.fillMaxWidth().height(45.dp).padding(horizontal = 16.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -125,12 +123,16 @@ private fun Header(c: CameraController) {
             c.phase == Phase.Starting -> "Calibrating…"
             else -> ""
         }
-        Text(status, color = if (c.recording) Color(0xFFFF4040) else Muted, fontSize = 14.sp)
+        // Tapping the frame rate shows where the time of each camera frame goes.
+        Text(
+            status, color = if (c.recording) Color(0xFFFF4040) else Muted, fontSize = 14.sp,
+            modifier = Modifier.clickable(enabled = c.phase == Phase.Live, onClick = toggleDiagnostics).padding(8.dp),
+        )
     }
 }
 
 @Composable
-private fun ImageArea(c: CameraController) {
+private fun ImageArea(c: CameraController, diagnostics: Boolean) {
     Box(
         Modifier.fillMaxSize().clickable(enabled = c.phase == Phase.Live) { c.recalibrate() },
         contentAlignment = Alignment.Center,
@@ -144,6 +146,13 @@ private fun ImageArea(c: CameraController) {
             )
         } else {
             Placeholder(c)
+        }
+        if (diagnostics && c.phase == Phase.Live && c.diagnostics.isNotEmpty()) {
+            Text(
+                c.diagnostics, color = Color.White, fontSize = 12.sp, lineHeight = 15.sp,
+                modifier = Modifier.align(Alignment.BottomStart).fillMaxWidth()
+                    .background(Color(0xB0000000)).padding(8.dp),
+            )
         }
         c.notice?.let {
             Text(
@@ -187,7 +196,7 @@ private fun OrientationBar(c: CameraController, modifier: Modifier) {
         ToolButton(Icons.Filled.Flip, "Mirror", v.mirror) { c.updateView(v.copy(mirror = !v.mirror)) }
         ToolButton(Icons.Filled.Flip, "Flip", v.flip, iconRotation = 90f) { c.updateView(v.copy(flip = !v.flip)) }
         // Rotation changes the image size, which a running (or starting) recording cannot follow.
-        ToolButton(Icons.AutoMirrored.Filled.RotateRight, "Rotate ${v.rotation}°", false, enabled = !c.recording && !c.busy) {
+        ToolButton(Icons.AutoMirrored.Filled.RotateRight, "Rotate ${v.rotation}°", false, enabled = !c.recording && !c.videoBusy) {
             c.updateView(v.copy(rotation = (v.rotation + 90) % 360))
         }
     }
@@ -243,31 +252,11 @@ private fun PaletteStrip(c: CameraController, modifier: Modifier) {
     }
 }
 
-/** Panel under the image (vendor: TouchBoardPanel): gallery, capture, photo/video by swipe. */
+/** Panel under the image (vendor: TouchBoardPanel): gallery and the capture button. */
 @Composable
-private fun CapturePanel(c: CameraController, mode: Mode, setMode: (Mode) -> Unit, modifier: Modifier) {
+private fun CapturePanel(c: CameraController, modifier: Modifier) {
     val context = LocalContext.current
-    Box(
-        modifier.background(PanelColor).pointerInput(c.recording) {
-            var drag = 0f
-            detectHorizontalDragGestures(
-                onDragStart = { drag = 0f },
-                onDragEnd = {
-                    if (!c.recording) {
-                        if (drag < -60f) setMode(Mode.Video) else if (drag > 60f) setMode(Mode.Photo)
-                    }
-                },
-            ) { _, delta -> drag += delta }
-        },
-    ) {
-        Column(Modifier.align(Alignment.TopCenter).padding(top = 10.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Mode.entries.forEach {
-                    Box(Modifier.size(8.dp).clip(CircleShape).background(if (it == mode) Color.White else Color(0xFF606060)))
-                }
-            }
-            Text(if (mode == Mode.Photo) "PHOTO" else "VIDEO", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp))
-        }
+    Box(modifier.background(PanelColor)) {
         Box(
             Modifier.align(Alignment.CenterStart).padding(start = 15.dp).size(60.dp).clip(CircleShape)
                 .clickable {
@@ -283,29 +272,47 @@ private fun CapturePanel(c: CameraController, mode: Mode, setMode: (Mode) -> Uni
         ) {
             Icon(Icons.Outlined.PhotoLibrary, "Gallery", tint = Color.White, modifier = Modifier.size(30.dp))
         }
-        CaptureButton(c, mode, Modifier.align(Alignment.Center))
+        CaptureButton(c, Modifier.align(Alignment.Center))
+    }
+}
+
+/** One button of two halves: the left takes a photo, the right starts and stops recording. */
+@Composable
+private fun CaptureButton(c: CameraController, modifier: Modifier) {
+    val live = c.phase == Phase.Live
+    val shape = RoundedCornerShape(36.dp)
+    Row(modifier.width(220.dp).height(72.dp).clip(shape).border(3.dp, Color.White, shape)) {
+        CaptureHalf(
+            label = "Photo", enabled = live && !c.photoBusy, busy = c.photoBusy,
+            background = Color.White, onClick = c::takePhoto, modifier = Modifier.weight(1f),
+        ) {
+            Icon(Icons.Filled.PhotoCamera, "Take photo", tint = Color.Black, modifier = Modifier.size(28.dp))
+        }
+        Box(Modifier.width(3.dp).fillMaxHeight().background(PanelColor))
+        CaptureHalf(
+            label = if (c.recording) "Stop" else "Video", enabled = live && !c.videoBusy, busy = c.videoBusy,
+            background = if (c.recording) Color(0xFFE02020) else Color.White,
+            onClick = c::toggleRecording, modifier = Modifier.weight(1f),
+        ) {
+            if (c.recording) Icon(Icons.Filled.Stop, "Stop recording", tint = Color.White, modifier = Modifier.size(30.dp))
+            else Icon(Icons.Filled.FiberManualRecord, "Start recording", tint = Color(0xFFE02020), modifier = Modifier.size(30.dp))
+        }
     }
 }
 
 @Composable
-private fun CaptureButton(c: CameraController, mode: Mode, modifier: Modifier) {
-    val enabled = c.phase == Phase.Live && !c.busy
-    Box(
-        modifier.size(68.dp).clip(CircleShape).border(3.dp, Color.White, CircleShape)
-            .clickable(enabled = enabled) { if (mode == Mode.Photo) c.takePhoto() else c.toggleRecording() },
-        contentAlignment = Alignment.Center,
+private fun CaptureHalf(
+    label: String, enabled: Boolean, busy: Boolean, background: Color, onClick: () -> Unit,
+    modifier: Modifier, icon: @Composable () -> Unit,
+) {
+    val content = if (background == Color.White) Color.Black else Color.White
+    Column(
+        modifier.fillMaxHeight().background(if (enabled || busy) background else Color(0xFF808080))
+            .clickable(enabled = enabled, onClick = onClick),
+        horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center,
     ) {
-        Box(
-            Modifier.size(56.dp).clip(CircleShape).background(if (enabled) Color.White else Color(0xFF808080)),
-            contentAlignment = Alignment.Center,
-        ) {
-            when {
-                c.busy -> CircularProgressIndicator(Modifier.size(28.dp), color = Color.Black, strokeWidth = 3.dp)
-                mode == Mode.Photo -> Icon(Icons.Filled.PhotoCamera, "Take photo", tint = Color.Black)
-                c.recording -> Icon(Icons.Filled.Stop, "Stop recording", tint = Color(0xFFE02020), modifier = Modifier.size(34.dp))
-                else -> Icon(Icons.Filled.FiberManualRecord, "Start recording", tint = Color(0xFFE02020), modifier = Modifier.size(34.dp))
-            }
-        }
+        if (busy) CircularProgressIndicator(Modifier.size(28.dp), color = content, strokeWidth = 3.dp) else icon()
+        Text(label, color = content, fontSize = 12.sp, fontWeight = FontWeight.Medium)
     }
 }
 

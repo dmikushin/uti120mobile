@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -84,6 +85,19 @@ std::unique_ptr<Transport> open_usb();
 // UsbDeviceConnection.getFileDescriptor()); the descriptor stays owned by the caller.
 std::unique_ptr<Transport> open_usb_fd(int fd);
 
+// Where the time of delivered frames goes; cumulative since the camera was
+// opened.  Times are sums in milliseconds; divide by `frames`.
+struct GrabStats {
+  long frames = 0;    // valid frames returned
+  long ignored = 0;   // frame requests the camera did not answer in time
+  long dropped = 0;   // frames rejected (stale, CRC, geometry)
+  long reads = 0;     // bulk reads of delivered frames
+  double drain_ms = 0;     // discarding stale data, includes the pause between requests
+  double first_ms = 0;     // request until the first bulk read returned
+  double transfer_ms = 0;  // first read until the frame was complete
+  double total_ms = 0;     // whole grab(), including ignored requests and drops
+};
+
 struct DeviceInfo {
   std::string firmware, hardware, sensor;
   uint32_t run_status, init_status;
@@ -112,6 +126,9 @@ class Camera {
   Transport& transport() { return *transport_; }
   std::optional<int> last_frame_id;
 
+  // Thread-safe copy; grab() runs on the capture thread.
+  GrabStats stats() const;
+
  private:
   void drain_cmd();
   std::vector<uint8_t> transact(const std::vector<uint8_t>& request);
@@ -119,6 +136,8 @@ class Camera {
   std::optional<std::vector<uint8_t>> read_frame_once();
 
   std::unique_ptr<Transport> transport_;
+  mutable std::mutex stats_mutex_;
+  GrabStats stats_;
 };
 
 std::string hex(const std::vector<uint8_t>& bytes);
