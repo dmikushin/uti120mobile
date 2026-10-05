@@ -349,19 +349,16 @@ object Prefs {
 
     fun loadView(c: Context) = prefs(c).let {
         val d = ViewSettings()
-        ViewSettings(
-            palette = it.getString("palette", d.palette)!!.takeIf { p -> p in NativeCamera.paletteNames } ?: d.palette,
-            mirror = it.getBoolean("mirror", d.mirror),
-            flip = it.getBoolean("flip", d.flip),
-            rotation = it.getInt("rotation", d.rotation),
-        )
+        // Orientation is fixed to the vendor app's portrait view; only the palette is chosen.
+        d.copy(palette = it.getString("palette", d.palette)!!.takeIf { p -> p in NativeCamera.paletteNames } ?: d.palette)
     }
 
     fun saveView(c: Context, v: ViewSettings) = prefs(c).edit {
         putString("palette", v.palette)
-        putBoolean("mirror", v.mirror)
-        putBoolean("flip", v.flip)
-        putInt("rotation", v.rotation)
+        // Orientation saved by 0.1.0-0.1.2, which had orientation controls.
+        remove("mirror")
+        remove("flip")
+        remove("rotation")
     }
 
     fun loadSettings(c: Context) = prefs(c).let {

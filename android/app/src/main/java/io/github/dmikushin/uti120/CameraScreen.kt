@@ -27,12 +27,9 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.RotateRight
 import androidx.compose.material.icons.filled.FiberManualRecord
-import androidx.compose.material.icons.filled.Flip
 import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material.icons.filled.PhotoCamera
-import androidx.compose.material.icons.filled.ScreenRotation
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.outlined.PhotoLibrary
@@ -54,11 +51,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.FilterQuality
-import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -72,7 +67,7 @@ private val ContentColor = Color(0xFF050316)  // black: behind the image
 private val PanelColor = Color(0xFF202020)    // panel under the image
 private val Muted = Color(0xFF8E898C)         // gray
 
-private enum class Tab { Orientation, Palettes, Settings }
+private enum class Tab { Palettes, Settings }
 
 @Composable
 fun CameraScreen(c: CameraController) {
@@ -94,7 +89,6 @@ fun CameraScreen(c: CameraController) {
                     Box(Modifier.width(w).height(h)) {
                         ImageArea(c, diagnostics)
                         when (tab) {
-                            Tab.Orientation -> OrientationBar(c, Modifier.align(Alignment.BottomCenter))
                             Tab.Palettes -> PaletteStrip(c, Modifier.align(Alignment.BottomCenter))
                             else -> {}
                         }
@@ -182,42 +176,6 @@ private fun Placeholder(c: CameraController) {
         if (c.phase == Phase.Failed || c.phase == Phase.NoCamera) {
             TextButton(onClick = { c.connect() }) { Text("Retry") }
         }
-    }
-}
-
-/** Mirror / flip / rotate, shown over the bottom of the image like the vendor's tool bars. */
-@Composable
-private fun OrientationBar(c: CameraController, modifier: Modifier) {
-    val v = c.view
-    Row(
-        modifier.fillMaxWidth().height(60.dp).background(Color(0xC00E0E0E)),
-        horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically,
-    ) {
-        ToolButton(Icons.Filled.Flip, "Mirror", v.mirror) { c.updateView(v.copy(mirror = !v.mirror)) }
-        ToolButton(Icons.Filled.Flip, "Flip", v.flip, iconRotation = 90f) { c.updateView(v.copy(flip = !v.flip)) }
-        // Rotation changes the image size, which a running (or starting) recording cannot follow.
-        ToolButton(Icons.AutoMirrored.Filled.RotateRight, "Rotate ${v.rotation}°", false, enabled = !c.recording && !c.videoBusy) {
-            c.updateView(v.copy(rotation = (v.rotation + 90) % 360))
-        }
-    }
-}
-
-@Composable
-private fun ToolButton(
-    icon: ImageVector, label: String, active: Boolean, iconRotation: Float = 0f,
-    enabled: Boolean = true, onClick: () -> Unit,
-) {
-    val tint = when {
-        !enabled -> Color(0xFF555555)
-        active -> Color(0xFFFFA000)
-        else -> Color.White
-    }
-    Column(
-        Modifier.clickable(enabled = enabled, onClick = onClick).padding(8.dp, 4.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        Icon(icon, label, tint = tint, modifier = Modifier.size(26.dp).rotate(iconRotation))
-        Text(label, color = tint, fontSize = 11.sp)
     }
 }
 
@@ -321,7 +279,6 @@ private fun CaptureHalf(
 private fun BottomBar(selected: Tab?, onSelect: (Tab) -> Unit) {
     Row(Modifier.fillMaxWidth().height(45.dp).background(BarColor), verticalAlignment = Alignment.CenterVertically) {
         listOf(
-            Tab.Orientation to Icons.Filled.ScreenRotation,
             Tab.Palettes to Icons.Filled.Palette,
             Tab.Settings to Icons.Filled.Settings,
         ).forEach { (tab, icon) ->
