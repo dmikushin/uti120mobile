@@ -24,9 +24,10 @@ import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.core.content.ContextCompat
 import androidx.core.content.edit
+import java.io.File
 import java.util.concurrent.Executors
 
-enum class Phase { NoCamera, AwaitingPermission, Starting, Live, Failed }
+enum class Phase { NoCamera, AwaitingPermission, ReadingCalibration, Restarting, Starting, Live, Failed }
 
 /**
  * Owns the USB connection and the native pipeline, and exposes their state to
@@ -68,6 +69,11 @@ class CameraController(private val context: Context) {
         private set
     var settings by mutableStateOf(Prefs.loadSettings(context))
         private set
+    var radiometry by mutableStateOf(Prefs.loadRadiometry(context))
+        private set
+    /** Temperatures of the shown image (spot values averaged over the last 5 frames). */
+    var temperatures by mutableStateOf<TemperatureSummary?>(null)
+        private set
     /** Short notice shown over the image (saved photo, errors of captures). */
     var notice by mutableStateOf<String?>(null)
         private set
@@ -90,16 +96,24 @@ class CameraController(private val context: Context) {
     private val recorderLock = Any()
     private var recorder: VideoRecorder? = null
     private var videoUri: Uri? = null
+    // The camera restarted after its calibration was read; the one that comes back must be it.
+    private var restartedSensor: String? = null
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context, intent: Intent) {
             when (intent.action) {
                 ACTION_PERMISSION -> {
-                    if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) connect()
-                    else fail("USB permission denied")
+                    if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) {
+                        setPhase(Phase.NoCamera, "")  // the request is answered
+                        connect()
+                    } else {
+                        fail("USB permission denied")
+                    }
                 }
                 UsbManager.ACTION_USB_DEVICE_DETACHED -> {
-                    if (device(intent)?.let(::isCamera) == true) disconnect(Phase.NoCamera, "")
+                    // While the calibration is read the camera is restarted on purpose.
+                    val expected = phase == Phase.ReadingCalibration || phase == Phase.Restarting
+                    if (!expected && device(intent)?.let(::isCamera) == true) disconnect(Phase.NoCamera, "")
                 }
             }
         }
@@ -114,9 +128,12 @@ class CameraController(private val context: Context) {
 
     /** Finds the camera, asks for permission if needed, then opens and calibrates it. */
     fun connect() {
-        if (phase == Phase.Starting || phase == Phase.Live) return
+        // Also triggered by USB_DEVICE_ATTACHED while a permission request is open.
+        if (phase in BUSY_PHASES || phase == Phase.AwaitingPermission) return
         replay?.let { path ->
-            start { NativeCamera(path, it.first, it.second) }
+            // Debug: temperatures too if a calibration was put into files/calibration/replay.
+            val dir = File(context.filesDir, "calibration/replay").takeIf { File(it, "coefficients.json").exists() }
+            start { sv, _ -> NativeCamera(path, sv.first, sv.second, dir, radiometry) }
             return
         }
         val device = usb.deviceList.values.firstOrNull(::isCamera)
@@ -130,21 +147,89 @@ class CameraController(private val context: Context) {
             usb.requestPermission(device, PendingIntent.getBroadcast(context, 0, intent, PendingIntent.FLAG_MUTABLE))
             return
         }
-        start {
+        start { sv, id ->
             val conn = usb.openDevice(device) ?: error("cannot open the USB device")
             connection = conn
-            NativeCamera(conn.fileDescriptor, it.first, it.second)
+            val sensor = NativeCamera.sensorId(conn.fileDescriptor)
+            restartedSensor?.let { expected ->
+                restartedSensor = null
+                check(sensor == expected) {
+                    "A different camera ($sensor) came back after restarting $expected."
+                }
+            }
+            val dir = calibrationDir(sensor)
+            val cached = File(dir, "coefficients.json").exists()
+            val problem = if (cached) NativeCamera.checkCalibration(dir, sensor) else null
+            if (problem != null) Log.w(TAG, "discarding the cached calibration: $problem")
+            if (cached && problem == null) {
+                NativeCamera(conn.fileDescriptor, sv.first, sv.second, dir, radiometry)
+            } else {
+                readCalibration(conn, dir, sensor, id)
+                null
+            }
         }
     }
 
-    /** Opens the camera with [open] on the worker, calibrates it and starts rendering. */
-    private fun start(open: (Pair<CameraSettings, ViewSettings>) -> NativeCamera) {
+    private fun calibrationDir(sensor: String) =
+        File(context.filesDir, "calibration/" + sensor.replace(Regex("[^A-Za-z0-9_.-]"), "_"))
+
+    /**
+     * Worker: reads the camera's calibration into [dir] (once per camera), then
+     * waits for the camera to come back from the restart the read requires and
+     * connects again.
+     */
+    private fun readCalibration(conn: UsbDeviceConnection, dir: File, sensor: String, id: Int) {
+        main.post { if (session == id) setPhase(Phase.ReadingCalibration, "") }
+        val partial = File(dir.parentFile, dir.name + ".partial")
+        partial.deleteRecursively()
+        check(partial.mkdirs()) { "cannot create $partial" }
+        val before = usb.deviceList.values.firstOrNull(::isCamera)?.deviceName
+        NativeCamera.readCalibration(conn.fileDescriptor, partial)
+        dir.deleteRecursively()
+        check(partial.renameTo(dir)) { "cannot store the calibration in $dir" }
+        connection = null
+        conn.close()
+        restartedSensor = sensor
+        main.post { if (session == id) setPhase(Phase.Restarting, "") }
+        val back = waitForCamera(before)
+        Log.i(TAG, "camera back after restart: $back")
+        main.post {
+            if (session != id) return@post
+            if (back) {
+                setPhase(Phase.NoCamera, "")
+                connect()
+            } else {
+                // It still may: the system then reports it as attached and the app connects.
+                fail("The camera has not come back after restarting yet. If it does not, unplug it and plug it in again.")
+            }
+        }
+    }
+
+    /**
+     * Worker: true once the camera has enumerated again after its restart,
+     * i.e. it is listed under a device name other than [before] (bounded).
+     */
+    private fun waitForCamera(before: String?): Boolean {
+        val deadline = SystemClock.uptimeMillis() + RESTART_TIMEOUT_MS
+        while (SystemClock.uptimeMillis() < deadline) {
+            val now = usb.deviceList.values.firstOrNull(::isCamera)?.deviceName
+            if (now != null && now != before) return true
+            Thread.sleep(200)
+        }
+        return false
+    }
+
+    /**
+     * Opens the camera with [open] on the worker, calibrates it and starts
+     * rendering; [open] returns null when it took the connection elsewhere.
+     */
+    private fun start(open: (Pair<CameraSettings, ViewSettings>, Int) -> NativeCamera?) {
         setPhase(Phase.Starting, "")
         val id = ++session
         val sv = settings to view
         worker.execute {
             try {
-                val cam = open(sv)
+                val cam = open(sv, id) ?: return@execute
                 camera = cam
                 cam.start()
                 startRendering(cam, id)
@@ -162,6 +247,7 @@ class CameraController(private val context: Context) {
         worker.execute { closeCamera() }
         setPhase(next, why)
         image = null
+        temperatures = null
     }
 
     fun shutdown() {
@@ -188,6 +274,13 @@ class CameraController(private val context: Context) {
         }
     }
 
+    /** Measuring conditions; applied from the next frame without restarting the camera. */
+    fun updateRadiometry(r: RadiometrySettings) {
+        radiometry = r
+        Prefs.saveRadiometry(context, r)
+        worker.execute { camera?.setRadiometry(r) }
+    }
+
     fun recalibrate() {
         if (phase != Phase.Live || calibrating) return
         calibrating = true
@@ -201,8 +294,8 @@ class CameraController(private val context: Context) {
         photoBusy = true
         worker.execute {
             val result = runCatching {
-                val shot = camera!!.snapshot(PHOTO_FRAMES)
-                Captures.savePhoto(context.contentResolver, shot, PHOTO_SCALE)
+                val (shot, temps) = camera!!.snapshot(PHOTO_FRAMES)
+                Captures.savePhoto(context.contentResolver, shot, PHOTO_SCALE, temps)
             }
             main.post {
                 photoBusy = false
@@ -287,14 +380,22 @@ class CameraController(private val context: Context) {
         var stats = cam.stats()
         var renderMs = 0.0
         var renders = 0
+        val raw = FloatArray(TemperatureSummary.LEN)
+        val smoothing = SpotSmoothing(5)
         while (rendering) {
             try {
                 val started = SystemClock.elapsedRealtimeNanos()
                 val bitmap = cam.newBitmap()
-                if (cam.render(bitmap)) {
-                    synchronized(recorderLock) { recorder?.write(bitmap) }
+                if (cam.render(bitmap, raw)) {
+                    val temps = TemperatureSummary.of(raw)?.let(smoothing::add)
+                    synchronized(recorderLock) { recorder?.write(bitmap, temps) }
                     val shown = bitmap.asImageBitmap()
-                    main.post { if (session == id) image = shown }
+                    main.post {
+                        if (session == id) {
+                            image = shown
+                            temperatures = temps
+                        }
+                    }
                 }
                 renderMs += (SystemClock.elapsedRealtimeNanos() - started) / 1e6
                 renders++
@@ -370,6 +471,27 @@ class CameraController(private val context: Context) {
         const val PRODUCT_ID = 0x1201
         const val PHOTO_FRAMES = 8
         const val PHOTO_SCALE = 4
+        private const val RESTART_TIMEOUT_MS = 20_000L
+        private val BUSY_PHASES = setOf(Phase.ReadingCalibration, Phase.Restarting, Phase.Starting, Phase.Live)
+    }
+}
+
+/**
+ * Running average of the spot values over the last [n] frames, as the vendor
+ * app does (UsbCameraHelper.callBackOneFrameBitmap); positions are the newest.
+ * After a jump of the settings the old values age out within [n] frames.
+ */
+class SpotSmoothing(private val n: Int) {
+    private val history = ArrayDeque<TemperatureSummary>()
+
+    fun add(t: TemperatureSummary): TemperatureSummary {
+        history.addLast(t)
+        if (history.size > n) history.removeFirst()
+        return t.copy(
+            centre = history.map { it.centre }.average().toFloat(),
+            min = history.map { it.min }.average().toFloat(),
+            max = history.map { it.max }.average().toFloat(),
+        )
     }
 }
 
@@ -399,5 +521,22 @@ object Prefs {
     fun saveSettings(c: Context, s: CameraSettings) = prefs(c).edit {
         putInt("darkFrames", s.darkFrames)
         putInt("recalibrateSeconds", s.recalibrateSeconds)
+    }
+
+    fun loadRadiometry(c: Context) = prefs(c).let {
+        val d = RadiometrySettings()
+        RadiometrySettings(
+            emissivity = it.getFloat("emissivity", d.emissivity),
+            reflected = it.getFloat("reflected", d.reflected),
+            distance = it.getFloat("distance", d.distance),
+            highRange = it.getBoolean("highRange", d.highRange),
+        )
+    }
+
+    fun saveRadiometry(c: Context, r: RadiometrySettings) = prefs(c).edit {
+        putFloat("emissivity", r.emissivity)
+        putFloat("reflected", r.reflected)
+        putFloat("distance", r.distance)
+        putBoolean("highRange", r.highRange)
     }
 }

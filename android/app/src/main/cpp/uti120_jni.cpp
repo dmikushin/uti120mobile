@@ -5,6 +5,7 @@
 #include <android/bitmap.h>
 #include <jni.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <iterator>
@@ -14,6 +15,7 @@
 #include "uti120/log.hpp"
 #include "uti120/palette.hpp"
 #include "uti120/pipeline.hpp"
+#include "uti120/radiometry.hpp"
 #include "uti120/replay.hpp"
 
 using namespace uti120;
@@ -75,25 +77,135 @@ bool copy_into(JNIEnv* env, jobject bitmap, const RgbImage& img) {
   return true;
 }
 
+// Temperature summary of one image in display coordinates (the view's
+// orientation, pixel units of the rendered image), as the Kotlin side reads it:
+//   {valid, centre, min, min_x, min_y, max, max_x, max_y}
+// Like the vendor app (UsbCameraHelper.callBackOneFrameBitmap), each spot value
+// is the mean over the 3x3 neighbourhood of the pixel, cut at the image edges;
+// the extremes are the hottest and coldest pixels.
+constexpr int SUMMARY_LEN = 8;
+
+void summarize(const Plane& temperature, const View& view, float* out) {
+  bool swap = view.rotation == 90 || view.rotation == 270;
+  int w = swap ? HEIGHT : WIDTH, h = swap ? WIDTH : HEIGHT;
+  // The same mapping as Renderer: display pixel -> sensor pixel.
+  std::vector<float> t(size_t(w) * h);
+  for (int y = 0; y < h; ++y)
+    for (int x = 0; x < w; ++x) {
+      int ox, oy;
+      switch (view.rotation) {
+        case 90: ox = y; oy = HEIGHT - 1 - x; break;
+        case 180: ox = WIDTH - 1 - x; oy = HEIGHT - 1 - y; break;
+        case 270: ox = WIDTH - 1 - y; oy = x; break;
+        default: ox = x; oy = y; break;
+      }
+      int sx = view.mirror ? WIDTH - 1 - ox : ox;
+      int sy = view.flip ? HEIGHT - 1 - oy : oy;
+      t[size_t(y) * w + x] = temperature[sy * WIDTH + sx];
+    }
+  auto spot = [&](int cx, int cy) {
+    double sum = 0;
+    int n = 0;
+    for (int y = std::max(0, cy - 1); y <= std::min(h - 1, cy + 1); ++y)
+      for (int x = std::max(0, cx - 1); x <= std::min(w - 1, cx + 1); ++x) {
+        sum += t[size_t(y) * w + x];
+        ++n;
+      }
+    return float(sum / n);
+  };
+  size_t lo = 0, hi = 0;
+  for (size_t i = 1; i < t.size(); ++i) {
+    if (t[i] < t[lo]) lo = i;
+    if (t[i] > t[hi]) hi = i;
+  }
+  int lx = int(lo % w), ly = int(lo / w), hx = int(hi % w), hy = int(hi / w);
+  float v[SUMMARY_LEN] = {1.0f, spot(w / 2, h / 2), spot(lx, ly), float(lx), float(ly),
+                          spot(hx, hy), float(hx), float(hy)};
+  std::copy(v, v + SUMMARY_LEN, out);
+}
+
+void write_summary(JNIEnv* env, jfloatArray dst, const std::optional<Plane>& temperature,
+                   const View& view) {
+  if (!dst) return;
+  if (env->GetArrayLength(dst) < SUMMARY_LEN) throw std::invalid_argument("summary array too short");
+  float v[SUMMARY_LEN] = {};
+  if (temperature && !temperature->empty()) summarize(*temperature, view, v);
+  env->SetFloatArrayRegion(dst, 0, SUMMARY_LEN, v);
+}
+
 }  // namespace
 
 extern "C" {
 
 // The camera is the USB device behind `fd` or, if `replay` is not null, the
-// raw frames recorded in that file (for testing without the device).
+// raw frames recorded in that file (for testing without the device).  With a
+// calibration directory (CameraCalibration::save layout), images carry
+// temperatures.
 JNIEXPORT jlong JNICALL Java_io_github_dmikushin_uti120_NativeCamera_nativeOpen(
     JNIEnv* env, jclass, jint fd, jstring replay, jint dark_frames, jdouble recalibrate_s,
-    jstring palette, jboolean mirror, jboolean flip, jint rotation) {
+    jstring palette, jboolean mirror, jboolean flip, jint rotation, jstring calibration_dir,
+    jfloat emissivity, jfloat reflected, jfloat distance, jboolean high_range) {
   return guarded(env, [&]() -> jlong {
     // Start-up and calibration messages are rare and useful in logcat.
     set_log_level(Level::Info);
     View view{to_string(env, palette), bool(mirror), bool(flip), int(rotation)};
+    Settings settings{int(dark_frames), double(recalibrate_s), nullptr};
+    if (calibration_dir) {
+      settings.calibration = CameraCalibration::load(to_string(env, calibration_dir));
+      settings.radiometry = {float(emissivity), float(reflected), float(distance), bool(high_range)};
+    }
     auto transport = replay ? open_replay(to_string(env, replay)) : open_usb_fd(fd);
-    auto p = std::make_unique<Pipeline>(std::move(transport),
-                                        Settings{int(dark_frames), double(recalibrate_s), nullptr},
-                                        view);
+    auto p = std::make_unique<Pipeline>(std::move(transport), settings, view);
     return reinterpret_cast<jlong>(p.release());
   }, jlong(0));
+}
+
+// Checks a cached calibration against the camera's sensor id: null if it
+// belongs to this camera, otherwise why not (CameraCalibration::validate).
+JNIEXPORT jstring JNICALL Java_io_github_dmikushin_uti120_NativeCamera_nativeCheckCalibration(
+    JNIEnv* env, jclass, jstring dir, jstring sensor) {
+  try {
+    CameraCalibration::load(to_string(env, dir)).validate(to_string(env, sensor));
+    return nullptr;
+  } catch (const std::exception& e) {
+    return env->NewStringUTF(e.what());
+  }
+}
+
+// The camera's sensor id (system registers 7..11), which names its calibration cache.
+JNIEXPORT jstring JNICALL Java_io_github_dmikushin_uti120_NativeCamera_nativeSensorId(
+    JNIEnv* env, jclass, jint fd) {
+  return guarded(env, [&]() -> jstring {
+    Camera cam(open_usb_fd(fd));
+    return env->NewStringUTF(cam.info().sensor.c_str());
+  }, static_cast<jstring>(nullptr));
+}
+
+// Reads the camera's calibration into `dir` and reboots the camera: after a
+// flash read the firmware delivers no frames until it restarts.  The camera
+// then leaves the bus and comes back as a new device; the caller closes `fd`.
+JNIEXPORT void JNICALL Java_io_github_dmikushin_uti120_NativeCamera_nativeReadCalibration(
+    JNIEnv* env, jclass, jint fd, jstring dir) {
+  guarded(env, [&] {
+    std::string path = to_string(env, dir);
+    Camera cam(open_usb_fd(fd));
+    read_camera_calibration(cam).save(path);
+    try {
+      cam.write_reg(SYS_WRITE, REG_REBOOT, 1);
+    } catch (const DeviceError&) {
+      // the camera may go away before it answers
+    }
+    return 0;
+  }, 0);
+}
+
+JNIEXPORT void JNICALL Java_io_github_dmikushin_uti120_NativeCamera_nativeSetRadiometry(
+    JNIEnv* env, jclass, jlong h, jfloat emissivity, jfloat reflected, jfloat distance,
+    jboolean high_range) {
+  guarded(env, [&] {
+    from_handle(h)->set_radiometry({float(emissivity), float(reflected), float(distance), bool(high_range)});
+    return 0;
+  }, 0);
 }
 
 JNIEXPORT void JNICALL Java_io_github_dmikushin_uti120_NativeCamera_nativeStart(JNIEnv* env,
@@ -116,10 +228,11 @@ JNIEXPORT jintArray JNICALL Java_io_github_dmikushin_uti120_NativeCamera_nativeI
   return out;
 }
 
-// Renders the newest image into `bitmap`; returns false if there is no image
-// yet (or the bitmap size no longer matches the view, after a rotation).
+// Renders the newest image into `bitmap` and its temperature summary into
+// `summary` (see summarize; valid = 0 without temperatures); returns false if
+// there is no image yet (or the bitmap size no longer matches the view).
 JNIEXPORT jboolean JNICALL Java_io_github_dmikushin_uti120_NativeCamera_nativeRender(
-    JNIEnv* env, jclass, jlong h, jobject bitmap) {
+    JNIEnv* env, jclass, jlong h, jobject bitmap, jfloatArray summary) {
   return guarded(env, [&]() -> jboolean {
     Pipeline* p = from_handle(h);
     auto im = p->newest(std::chrono::milliseconds(100));
@@ -129,16 +242,21 @@ JNIEXPORT jboolean JNICALL Java_io_github_dmikushin_uti120_NativeCamera_nativeRe
     if (AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS)
       throw std::runtime_error("cannot read bitmap info");
     if (int(info.width) != img.width || int(info.height) != img.height) return JNI_FALSE;
+    write_summary(env, summary, im->temperature, p->view());
     return copy_into(env, bitmap, img) ? JNI_TRUE : JNI_FALSE;
   }, jboolean(JNI_FALSE));
 }
 
-// Average of the next n images, rendered into `bitmap`.
+// Average of the next n images, rendered into `bitmap`, with the summary of
+// their mean temperatures.
 JNIEXPORT void JNICALL Java_io_github_dmikushin_uti120_NativeCamera_nativeSnapshot(
-    JNIEnv* env, jclass, jlong h, jint n, jobject bitmap) {
+    JNIEnv* env, jclass, jlong h, jint n, jobject bitmap, jfloatArray summary) {
   guarded(env, [&] {
     Pipeline* p = from_handle(h);
-    copy_into(env, bitmap, p->render(p->snapshot(int(n))));
+    Plane temperature;
+    copy_into(env, bitmap, p->render(p->snapshot(int(n), nullptr, &temperature)));
+    write_summary(env, summary, temperature.empty() ? std::nullopt : std::optional<Plane>(temperature),
+                  p->view());
     return 0;
   }, 0);
 }

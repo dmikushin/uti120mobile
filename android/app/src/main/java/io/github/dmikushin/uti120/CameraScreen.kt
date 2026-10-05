@@ -13,7 +13,14 @@ import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import kotlinx.coroutines.delay
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
+import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -121,6 +128,14 @@ private fun Header(c: CameraController, toggleDiagnostics: () -> Unit) {
     ) {
         Text("UTi120Mobile", color = Color.White, fontWeight = FontWeight.Medium, fontSize = 17.sp)
         Spacer(Modifier.weight(1f))
+        val t = c.temperatures
+        if (t != null && c.phase == Phase.Live) {
+            Text("▲ " + TemperatureOverlay.format(t.max), color = Color(0xFFFF6B60), fontSize = 14.sp,
+                fontWeight = FontWeight.Medium)
+            Spacer(Modifier.width(10.dp))
+            Text("▼ " + TemperatureOverlay.format(t.min), color = Color(0xFF6FA8FF), fontSize = 14.sp,
+                fontWeight = FontWeight.Medium)
+        }
         val status = when {
             c.calibrating -> "Calibrating…"
             c.phase == Phase.Live -> "%.0f fps".format(c.fps)
@@ -148,6 +163,14 @@ private fun ImageArea(c: CameraController, diagnostics: Boolean) {
                 modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Fit,
                 filterQuality = FilterQuality.Medium,
             )
+            c.temperatures?.let { t ->
+                // The image area has the image's 3:4 aspect, so the image fills it exactly.
+                Canvas(Modifier.fillMaxSize()) {
+                    drawIntoCanvas {
+                        TemperatureOverlay.draw(it.nativeCanvas, size.width, size.height, image.width, image.height, t)
+                    }
+                }
+            }
         } else {
             Placeholder(c)
         }
@@ -172,13 +195,16 @@ private fun ImageArea(c: CameraController, diagnostics: Boolean) {
 private fun Placeholder(c: CameraController) {
     Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(24.dp)) {
         when (c.phase) {
-            Phase.Starting, Phase.Live -> CircularProgressIndicator(color = Color.White)
+            Phase.ReadingCalibration, Phase.Restarting, Phase.Starting, Phase.Live ->
+                CircularProgressIndicator(color = Color.White)
             else -> Icon(Icons.Outlined.Usb, null, tint = Muted, modifier = Modifier.size(48.dp))
         }
         Spacer(Modifier.height(16.dp))
         val text = when (c.phase) {
             Phase.NoCamera -> "Connect the UNI-T UTi120Mobile camera"
             Phase.AwaitingPermission -> "Allow access to the camera"
+            Phase.ReadingCalibration -> "Reading the camera's calibration…\n(once per camera)"
+            Phase.Restarting -> "Restarting the camera…"
             Phase.Starting, Phase.Live -> "Calibrating the camera…"
             Phase.Failed -> c.message
         }
@@ -330,15 +356,35 @@ private fun BottomBar(selected: Tab?, onSelect: (Tab) -> Unit) {
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun SettingsDialog(c: CameraController, onDismiss: () -> Unit) {
     val s = c.settings
+    val r = c.radiometry
     AlertDialog(
         onDismissRequest = onDismiss,
         confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
         title = { Text("Settings") },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Emissivity of the target")
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf(0.95f, 0.90f, 0.85f, 0.70f, 0.50f).forEach { e ->
+                        FilterChip(r.emissivity == e, { c.updateRadiometry(r.copy(emissivity = e)) }, { Text("%.2f".format(e)) })
+                    }
+                }
+                Text("Distance to the target")
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf(0.3f, 0.6f, 1.0f, 2.0f).forEach { d ->
+                        FilterChip(r.distance == d, { c.updateRadiometry(r.copy(distance = d)) }, { Text("%.1f m".format(d)) })
+                    }
+                }
+                Text("Measuring range")
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(!r.highRange, { c.updateRadiometry(r.copy(highRange = false)) }, { Text("Normal") })
+                    FilterChip(r.highRange, { c.updateRadiometry(r.copy(highRange = true)) }, { Text("High, above 120 °C") })
+                }
+                Spacer(Modifier.height(4.dp))
                 Text("Shutter frames averaged for calibration")
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     listOf(8, 16, 32).forEach { n ->
