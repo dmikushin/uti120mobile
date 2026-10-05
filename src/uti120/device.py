@@ -163,8 +163,15 @@ class Camera:
             if reply[:3] != request[:3]:
                 raise DeviceError(f"bad reply to transfer command {request.hex()}: {reply.hex()}")
 
-        self._drain_bulk()
+        # Stop the camera first, then discard whatever is still in flight (the
+        # rest of a frame of an interrupted stream), so nothing stale precedes the package.
         self.set_run_status(RUN_IDLE)
+        while True:
+            try:
+                stale = self.dev.read(EP_BULK_IN, CHUNK, 100)
+                log.debug("discarded %d stale bulk bytes before the upload", len(stale))
+            except usb.core.USBTimeoutError:
+                break
         self.set_run_status(RUN_UPLOAD)
         transfer(0, address, length)
         data = bytearray()
@@ -173,6 +180,11 @@ class Camera:
                 block = bytes(self.dev.read(EP_BULK_IN, CHUNK, 1000))
             except usb.core.USBTimeoutError:
                 raise DeviceError(f"calibration upload stalled after {len(data)} bytes") from None
+            # Every package starts with its header length (0xd8) and "TI_CAL_METHOD".
+            if not data and not block.startswith(b"\xd8\x00\x00\x00TI_CAL"):
+                raise DeviceError(f"calibration upload: the first {len(block)} bytes are not a "
+                                  f"calibration package (stale data from an interrupted stream?): "
+                                  f"{block[:16].hex()}")
             transfer(2, zlib.crc32(block), len(block))
             data += block
         if len(data) != length:

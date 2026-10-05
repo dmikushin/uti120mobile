@@ -3,6 +3,7 @@
 #include <libusb.h>
 #include <zlib.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 
@@ -285,8 +286,11 @@ std::vector<uint8_t> Camera::read_calibration(CalibrationPackage which) {
       throw DeviceError("bad reply to transfer command " + hex(req) + ": " + hex(reply));
   };
 
-  drain_bulk();
+  // Stop the camera first, then discard whatever is still in flight (the rest
+  // of a frame of an interrupted stream), so nothing stale precedes the package.
   set_run_status(RUN_IDLE);
+  while (auto stale = transport_->read(EP_BULK_IN, CHUNK, 100))
+    LOG_DEBUG(LOG, "discarded %zu stale bulk bytes before the upload", stale->size());
   set_run_status(RUN_UPLOAD);
   {
     auto v = be32(address);
@@ -299,6 +303,13 @@ std::vector<uint8_t> Camera::read_calibration(CalibrationPackage which) {
   while (data.size() < length) {
     auto block = transport_->read(EP_BULK_IN, CHUNK, 1000);
     if (!block) throw DeviceError("calibration upload stalled after " + std::to_string(data.size()) + " bytes");
+    // Every package starts with its header length (0xd8) and "TI_CAL_METHOD".
+    static const uint8_t head[] = {0xd8, 0, 0, 0, 'T', 'I', '_', 'C', 'A', 'L'};
+    if (data.empty() &&
+        (block->size() < sizeof head || !std::equal(head, head + sizeof head, block->begin())))
+      throw DeviceError("calibration upload: the first " + std::to_string(block->size()) +
+                        " bytes are not a calibration package (stale data from an interrupted stream?): " +
+                        hex(std::vector<uint8_t>(block->begin(), block->begin() + std::min<size_t>(block->size(), 16))));
     uint32_t crc = uint32_t(crc32(0L, block->data(), uInt(block->size())));
     auto v = be32(crc);
     auto n = be32(uint32_t(block->size()));
