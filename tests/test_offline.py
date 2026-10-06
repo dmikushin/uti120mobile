@@ -10,7 +10,7 @@ import pytest
 import usb.core
 
 from uti120 import palette
-from uti120.device import Camera, DeviceError
+from uti120.device import Camera, CameraStuck, DeviceError
 from uti120.frame import FRAME_BYTES, Frame, FrameError
 from uti120.process import Calibration
 
@@ -169,3 +169,15 @@ def test_grab_repeats_ignored_requests():
     f = cam.grab()
     assert f.words.tobytes() == frame
     assert cam.dev.written == [b"\x81", b"\x81"]
+
+
+def test_silent_camera_is_recognised():
+    """A camera that sends nothing at all (left after a calibration upload
+    without a reboot) is told apart from one that sends broken frames."""
+    with pytest.raises(CameraStuck):
+        fake_camera().grab(retries=3)
+    frame = load("open4.bin.gz")[0]
+    partial = [None, frame[:4096], None] * 3   # drain, first chunk, then nothing
+    with pytest.raises(DeviceError) as e:
+        fake_camera(bulk=partial).grab(retries=3)
+    assert not isinstance(e.value, CameraStuck)

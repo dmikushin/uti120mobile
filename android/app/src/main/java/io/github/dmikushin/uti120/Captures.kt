@@ -3,6 +3,7 @@ package io.github.dmikushin.uti120
 import android.content.ContentResolver
 import android.content.ContentValues
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.net.Uri
 import android.os.Environment
 import android.provider.MediaStore
@@ -17,9 +18,14 @@ object Captures {
 
     private fun stamp(): String = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
 
-    /** Saves [image] upscaled by [scale] with bilinear filtering as PNG. */
-    fun savePhoto(resolver: ContentResolver, image: Bitmap, scale: Int): Uri {
+    /** Saves [image] upscaled by [scale] with bilinear filtering, with the temperature markers, as PNG. */
+    fun savePhoto(resolver: ContentResolver, image: Bitmap, scale: Int, temperatures: TemperatureSummary?): Uri {
         val scaled = image.scale(image.width * scale, image.height * scale, filter = true)
+            .copy(Bitmap.Config.ARGB_8888, true)
+        temperatures?.let {
+            TemperatureOverlay.draw(Canvas(scaled), scaled.width.toFloat(), scaled.height.toFloat(),
+                image.width, image.height, it)
+        }
         val values = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, "uti120_${stamp()}.png")
             put(MediaStore.Images.Media.MIME_TYPE, "image/png")

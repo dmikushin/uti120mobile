@@ -14,6 +14,8 @@ handling and image processing:
   backend (`cpp/core`), with the vendor app's screen layout: live image, tap
   for a photo and hold for video, palettes, tap the image to recalibrate.
 
+All of them measure temperatures in °C with the camera's own calibration.
+
 ## Example
 
 <img src="docs/screenshot-android.jpg" width="360" alt="The Android app showing a thermal image of a PC motherboard">
@@ -98,7 +100,25 @@ calibration periodically during long recordings), `-v` (log; `-vv` protocol
 debug).
 
 The image is relative: brighter means warmer, scaled automatically between the
-1st and 99th percentile. Radiometric temperatures are not implemented.
+1st and 99th percentile.
+
+### Temperatures
+
+```sh
+uti120 snapshot --celsius -o board.png       # also prints min/max/mean/centre in C
+uti120 snapshot --celsius --npy board.npy    # ...and saves the 120x90 map in C
+uti120 live --celsius                        # min/max/centre in the window title (C++ tool)
+uti120 log -t 600 --interval 1 -o gpu.csv    # CSV time series: a GPU under load
+```
+
+`--emissivity E` (default 0.95), `--distance M` (0.6), `--reflected C` (23) and
+`--high-range` (for targets above ~120 °C) set the measuring conditions.
+
+The first `--celsius` run reads the camera's own calibration (about 0.5 MB from
+its flash plus eight correction coefficients) and caches it in
+`~/.cache/uti120/<sensor id>`. The camera's firmware stops sending frames after
+that read until it restarts, so the tool restarts the camera and waits for it;
+later runs use the cache.
 
 ## How it works
 
@@ -124,6 +144,32 @@ The raw image is dominated by per-pixel offsets. At start-up the program asks th
 camera for an NUC, closes the shutter, averages 16 frames as the offset map,
 opens the shutter and subtracts that map from every frame; outlier pixels are
 replaced by the median of their neighbours.
+
+Temperatures are computed exactly as the vendor app computes them, from the
+calibration stored in each camera:
+
+1. **Raw frame → Y16.** Offset against the last shutter frame times a per-pixel
+   gain chosen by the sensor temperature (7 gain tables per range), bad-pixel
+   replacement, column and row stripe removal (range-weighted 9-tap filters),
+   a 3×3 Gaussian.
+2. **Y16 → °C.** Counts-to-temperature curves for 7 sensor temperatures and two
+   calibration distances, interpolated between them; corrected for the drift of
+   the lens temperature since the last shutter; then for emissivity and
+   reflected temperature through a radiance table.
+3. **Band correction.** A linear `k·t + b` per temperature band from the camera's
+   registers 49..56.
+
+Steps 1 and 2 are reimplementations, written from the decompiled library (Python: `src/uti120/vendor_y16.py`,
+`vendor_temp.py`; C++: `cpp/core/src/radiometry.cpp`) that match the vendor's
+native library bit for bit: the tests compare them with outputs of that
+library run on recorded and synthetic frames (`tests/data/radiometry`). The
+only data taken from the vendor's library is the 16384-entry radiance table
+used for the emissivity correction (`src/uti120/data/emiss_curve.bin`); it is
+close to, but not exactly, a Planck integral over 8–13 µm (up to ~3 °C apart
+at room temperature), and the exact table is needed to match the vendor.
+
+The accuracy is therefore the vendor's: this is the same computation on the
+same calibration, not an independent measurement.
 
 ## Tests
 

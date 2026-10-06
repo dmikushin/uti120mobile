@@ -1,0 +1,242 @@
+"""Temperatures in degrees Celsius, computed the way the vendor app computes them.
+
+The camera stores its calibration in flash: two packages (low and high
+measuring range) holding per-pixel gains and counts-to-temperature curves, and
+eight correction coefficients in system registers 49..56.  The vendor app reads
+them once, then for every frame
+
+  1. turns the raw frame into a Y16 image (vendor_y16: gain/offset correction
+     against the last shutter frame, bad pixels, stripe removal, smoothing),
+  2. maps each Y16 value to a temperature with the curves, corrected for the
+     camera's own temperatures from the frame header (vendor_temp),
+  3. applies a linear correction k*t + b chosen by temperature band
+     (MainActivity.genCalibrationValue).
+
+Steps 1 and 2 reproduce the vendor's native library bit for bit (checked
+against it on recorded frames, see tests/test_radiometry.py); step 3 is its
+Java code.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import numpy as np
+import usb.core
+
+from . import vendor_temp, vendor_y16
+from .device import (
+    CALIBRATION_HIGH,
+    CALIBRATION_LOW,
+    PID,
+    VID,
+    Camera,
+    CameraStuck,
+    DeviceError,
+)
+
+log = logging.getLogger(__name__)
+
+
+class WrongCamera(DeviceError):
+    """A calibration, or the camera after a restart, belongs to another sensor."""
+
+
+PACKAGE_MAGIC = b"TI_CAL_METHOD"
+
+
+@dataclass
+class CameraCalibration:
+    """Everything the camera stores for temperature measurement."""
+
+    low: bytes                 # calibration package, low range (flash 0x132000)
+    high: bytes                # calibration package, high range (flash 0x100000)
+    coefficients: list         # system registers 49..56, k and b of four bands, x10000
+
+    def validate(self, sensor: str):
+        """Raises DeviceError unless both packages parse and belong to `sensor`
+        (each package carries the serial number of its camera)."""
+        for name, package in (("low", self.low), ("high", self.high)):
+            if PACKAGE_MAGIC not in package[:0x40]:
+                raise DeviceError(f"{name} calibration package has an unknown format")
+            serial = vendor_temp.Package.parse(package).serial
+            if serial != sensor:
+                raise WrongCamera(f"{name} calibration package is for camera {serial!r}, "
+                                  f"the connected camera is {sensor!r}")
+        if len(self.coefficients) != 8:
+            raise DeviceError("calibration coefficients: expected 8 values")
+
+    def save(self, directory: Path):
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "low.bin").write_bytes(self.low)
+        (directory / "high.bin").write_bytes(self.high)
+        (directory / "coefficients.json").write_text(json.dumps(self.coefficients))
+
+    @classmethod
+    def load(cls, directory: Path) -> CameraCalibration:
+        return cls((directory / "low.bin").read_bytes(), (directory / "high.bin").read_bytes(),
+                   json.loads((directory / "coefficients.json").read_text()))
+
+
+def cache_dir() -> Path:
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return Path(base) / "uti120"
+
+
+def calibrated_camera(cam: Camera, cache: Path | None = None):
+    """Returns (CameraCalibration, Camera) for the connected camera.
+
+    The calibration is read from the camera once and cached per sensor id.
+    Reading it makes the firmware stop streaming until the camera reboots, so
+    after a read the camera is rebooted and opened again; the returned Camera
+    is the one to use.
+    """
+    sensor = cam.info()["sensor"]
+    directory = (cache or cache_dir()) / sensor
+    if (directory / "coefficients.json").exists():
+        cal = CameraCalibration.load(directory)
+        cal.validate(sensor)
+        return cal, cam
+    log.info("reading the calibration of camera %s (once; it is cached in %s)", sensor, directory)
+
+    def read(cam):
+        return CameraCalibration(cam.read_calibration_package(CALIBRATION_LOW),
+                                 cam.read_calibration_package(CALIBRATION_HIGH),
+                                 cam.read_calibration_coefficients())
+    try:
+        cal = read(cam)
+    except CameraStuck as e:
+        log.warning("%s; restarting the camera", e)
+        cam = restart(cam, sensor)
+        cal = read(cam)
+    cal.validate(sensor)
+    cal.save(directory)
+    # The firmware sends no frames after an upload until it is restarted.
+    return cal, restart(cam, sensor)
+
+
+def usb_address():
+    """(bus, address) of the camera, or None.  A reboot changes the address."""
+    d = usb.core.find(idVendor=VID, idProduct=PID)
+    return None if d is None else (d.bus, d.address)
+
+
+def restart(cam: Camera, sensor: str) -> Camera:
+    """Reboots the camera and returns it opened again, once it is back.
+
+    Measured (10 reboots): the old device keeps answering, in its old state,
+    for about 1.0 s after the reboot command before it leaves the bus; the new
+    one reports init_status 1 about 3.3 s after the command.  So first wait
+    for the address to change, then for init_status.
+    """
+    old = usb_address()
+    cam.reboot()
+    cam.close()
+    deadline = time.monotonic() + 10
+    while usb_address() == old:
+        if time.monotonic() > deadline:
+            raise DeviceError("the camera did not restart")
+        time.sleep(0.05)
+    deadline = time.monotonic() + 15
+    while True:
+        try:
+            cam = Camera()
+            info = cam.info()
+            if info["init_status"] == 1:
+                if info["sensor"] != sensor:
+                    cam.close()
+                    raise WrongCamera(f"after the restart a different camera answered "
+                                      f"({info['sensor']!r}, expected {sensor!r})")
+                return cam
+            cam.close()
+        except WrongCamera:
+            raise
+        except (DeviceError, OSError) as e:
+            if time.monotonic() > deadline:
+                raise DeviceError(f"camera did not come back after restart: {e}") from None
+        time.sleep(0.1)
+
+
+@dataclass
+class Settings:
+    emissivity: float = 0.95   # vendor default (SRateBean)
+    reflected: float = 23.0    # degrees C; the vendor core's default
+    distance: float = 0.6      # metres; vendor default (ConfigBean.refDistant)
+    high_range: bool = False   # measuring range: low (default) or high
+
+
+def band_correction(t: np.ndarray, coefficients, high_range: bool) -> np.ndarray:
+    """MainActivity.genCalibrationValue, per pixel, in float32 like the Java code."""
+    c = np.asarray(coefficients, np.float32) / np.float32(10000.0)
+    t = np.asarray(t, np.float32)
+    k = np.ones_like(t)
+    b = np.zeros_like(t)
+    for (kk, bb), sel in (((c[0], c[1]), t <= 0),
+                          ((c[2], c[3]), (t > 0) & (t <= 80)),
+                          ((c[4], c[5]), (t > 80) & (t <= 150))):
+        k = np.where(sel, kk, k)
+        b = np.where(sel, bb, b)
+    if high_range:
+        hot = t > 100
+        k = np.where(hot, c[6], k)
+        b = np.where(hot, c[7], b)
+    return np.where(k > 0, k * t + b, t).astype(np.float32)
+
+
+@dataclass
+class Radiometer:
+    """Feed every frame in order (shutter frames included); open frames yield temperatures."""
+
+    calibration: CameraCalibration
+    settings: Settings = field(default_factory=Settings)
+
+    def __post_init__(self):
+        self.packages = {False: self.calibration.low, True: self.calibration.high}
+        self.y16 = vendor_y16.Y16Model(vendor_y16.Package.parse(self.packages[self.settings.high_range]))
+        self.state = vendor_temp.State()
+        self.have_reference = False
+        self._temperature_model()
+
+    def _temperature_model(self):
+        s = self.settings
+        self.model = vendor_temp.TemperatureModel(
+            vendor_temp.Package.parse(self.packages[s.high_range]),
+            vendor_temp.Settings(s.emissivity, s.reflected, s.distance), high=s.high_range)
+
+    def set_settings(self, settings: Settings):
+        """Takes effect from the next frame.  A range change behaves like the
+        vendor's SetMeasureMode: the shutter reference and the camera
+        temperature history are kept, the per-pixel gain table restarts at 0."""
+        if settings.high_range != self.settings.high_range:
+            self.y16.set_package(vendor_y16.Package.parse(self.packages[settings.high_range]))
+        self.settings = settings
+        self._temperature_model()
+
+    def feed(self, frame: bytes) -> bool:
+        """Processes the next frame; True if temperatures() can be asked for it.
+
+        False for shutter frames and until the first shutter frame has been seen
+        (the vendor app does not measure before its first shutter/NUC either).
+        Every frame must be fed, in order: the shutter frames are the reference
+        and the frame headers carry the camera temperatures the curves depend on.
+        """
+        words = np.frombuffer(frame, "<i2", 16)
+        self._y16 = np.rot90(self.y16.process(frame), -1)   # back to the sensor's 120 x 90
+        self.state.update(words)
+        if words[12] == 1:
+            self.have_reference = True
+            return False
+        return self.have_reference
+
+    def temperatures(self) -> np.ndarray:
+        """float32[90, 120] degrees C of the last frame fed, in sensor orientation."""
+        # Within a frame the temperature depends on the Y16 value only.
+        values, index = np.unique(self._y16, return_inverse=True)
+        t = np.array([self.model.temperature(int(v), self.state) for v in values], np.float32)
+        t = band_correction(t, self.calibration.coefficients, self.settings.high_range)
+        return t[index].reshape(self._y16.shape)

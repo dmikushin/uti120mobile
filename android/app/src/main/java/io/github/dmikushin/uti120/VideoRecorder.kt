@@ -64,11 +64,15 @@ class VideoRecorder(output: ParcelFileDescriptor, imageWidth: Int, imageHeight: 
         drainer = Thread({ drain() }, "uti120-video").apply { start() }
     }
 
-    fun write(image: Bitmap) {
+    /** Draws [image] (and the temperature markers of [temperatures]) as the next frame. */
+    fun write(image: Bitmap, temperatures: TemperatureSummary?) {
         failure?.let { throw IllegalStateException("video encoder failed", it) }
         val canvas = surface.lockHardwareCanvas()
         try {
             canvas.drawBitmap(image, null, Rect(0, 0, width, height), paint)
+            temperatures?.let {
+                TemperatureOverlay.draw(canvas, width.toFloat(), height.toFloat(), image.width, image.height, it)
+            }
         } finally {
             surface.unlockCanvasAndPost(canvas)
         }

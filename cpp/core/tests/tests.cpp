@@ -10,12 +10,15 @@
 #include <deque>
 #include <filesystem>
 #include <functional>
+#include <map>
+#include <variant>
 #include <numeric>
 #include <string>
 #include <vector>
 
 #include "uti120/device.hpp"
 #include "uti120/pipeline.hpp"
+#include "uti120/radiometry.hpp"
 #include "uti120/replay.hpp"
 #include "uti120/palette.hpp"
 #include "uti120/process.hpp"
@@ -275,6 +278,323 @@ TEST(test_pipeline_on_replay) {
   CHECK(throws<DeviceError>([&] { open_replay("/nonexistent.raw"); }, "cannot open"));
 }
 
+// --- Radiometry: tests/data/radiometry, shared with tests/test_radiometry.py.
+// The goldens come from the vendor's libguide_sdk_unitrend.so fed the same
+// data; everything must match exactly.
+
+std::vector<uint8_t> read_gz(const std::string& name) {
+  std::string path = std::string(TEST_DATA_DIR) + "/radiometry/" + name;
+  gzFile gz = gzopen(path.c_str(), "rb");
+  if (!gz) throw std::runtime_error("cannot open " + path);
+  std::vector<uint8_t> out;
+  uint8_t buf[65536];
+  for (int n; (n = gzread(gz, buf, sizeof buf)) > 0;) out.insert(out.end(), buf, buf + n);
+  gzclose(gz);
+  return out;
+}
+
+// A frame from 25600 bytes without validation (synthetic frames carry stale CRCs).
+Frame raw_frame(const uint8_t* bytes) {
+  Frame f;
+  std::memcpy(f.words.data(), bytes, FRAME_BYTES);
+  return f;
+}
+
+std::vector<Frame> radiometry_frames(const std::string& name) {
+  auto raw = read_gz(name);
+  std::vector<Frame> out;
+  for (size_t i = 0; i + FRAME_BYTES <= raw.size(); i += FRAME_BYTES) out.push_back(raw_frame(&raw[i]));
+  return out;
+}
+
+// The golden Y16 is the vendor's portrait image (90 wide, 120 tall): pixel
+// (i, j) of it is sensor pixel (row j, column 119 - i).
+bool equals_rotated(const std::vector<int16_t>& sensor, const int16_t* portrait) {
+  for (int i = 0; i < WIDTH; ++i)
+    for (int j = 0; j < HEIGHT; ++j)
+      if (portrait[i * HEIGHT + j] != sensor[j * WIDTH + (WIDTH - 1 - i)]) return false;
+  return true;
+}
+
+template <class T>
+std::vector<T> radiometry_golden(const std::string& name) {
+  auto raw = read_gz(name);
+  std::vector<T> out(raw.size() / sizeof(T));
+  std::memcpy(out.data(), raw.data(), out.size() * sizeof(T));
+  return out;
+}
+
+struct RadiometryCase {
+  const char* name;
+  bool high;
+  float emissivity, distance;
+};
+const RadiometryCase kRadiometryCases[] = {{"low", false, 0.95f, 0.6f}, {"high", true, 0.90f, 1.0f}};
+
+TEST(test_radiometry_matches_vendor_core) {
+  auto frames = radiometry_frames("frames.raw.gz");
+  for (const auto& c : kRadiometryCases) {
+    auto pkg = vendor::Package::parse(read_gz(c.high ? "high.bin.gz" : "low.bin.gz"));
+    auto want_y16 = radiometry_golden<int16_t>(std::string("y16-") + c.name + ".i16.gz");
+    auto want_t = radiometry_golden<float>(std::string("temp-") + c.name + ".f32.gz");
+    vendor::Y16Model model;
+    vendor::MeasureState state;
+    vendor::TemperatureSettings ts{c.emissivity, 23.0f, c.distance};
+    size_t k = 0;
+    bool y16_ok = true, t_ok = true;
+    for (const Frame& f : frames) {
+      auto y16 = model.process(f, pkg);
+      state.update(f);
+      if (f.shutter_closed()) continue;
+      y16_ok &= equals_rotated(y16, &want_y16[k * PIXELS]);
+      std::vector<int16_t> t_bits(PIXELS);  // compare floats exactly via the rotated layout
+      for (int i = 0; i < WIDTH; ++i)
+        for (int j = 0; j < HEIGHT; ++j) {
+          float t = vendor::temperature(y16[j * WIDTH + (WIDTH - 1 - i)], pkg, ts, state, c.high);
+          t_ok &= std::memcmp(&t, &want_t[k * PIXELS + i * HEIGHT + j], sizeof t) == 0;
+        }
+      ++k;
+    }
+    CHECK(k == 4);
+    CHECK(y16_ok);
+    CHECK(t_ok);
+  }
+}
+
+TEST(test_radiometer_orientation_and_range) {
+  CameraCalibration cal;
+  cal.low = read_gz("low.bin.gz");
+  cal.high = read_gz("high.bin.gz");
+  cal.coefficients = {10000, 0, 10000, 0, 10000, 0, 10000, 0};  // identity correction
+  Radiometer r(cal, RadiometrySettings{0.95f, 23.0f, 0.6f, false});
+  std::vector<Plane> temps;
+  for (const Frame& f : radiometry_frames("frames.raw.gz"))
+    if (auto t = r.feed(f)) temps.push_back(*t);
+  CHECK(temps.size() == 4);
+  auto want = radiometry_golden<float>("temp-low.f32.gz");
+  bool same = true;
+  for (int i = 0; i < WIDTH; ++i)
+    for (int j = 0; j < HEIGHT; ++j)
+      same &= temps.back()[j * WIDTH + (WIDTH - 1 - i)] == want[3 * PIXELS + i * HEIGHT + j];
+  CHECK(same);
+  auto [mn, mx] = std::minmax_element(temps.back().begin(), temps.back().end());
+  CHECK(15 < *mn && *mx < 80);  // a running motherboard
+}
+
+// Low range, switched to the high range before frame 22 (the vendor's
+// guideCoreSetMeasureMode(1)), on the fixture frames with the sensor
+// temperature set to 27.50 C, where the two packages pick different gain
+// tables.  Goldens: the vendor core's Y16 and temperatures of frames 20..23.
+TEST(test_range_switch_matches_vendor_core) {
+  CameraCalibration cal;
+  cal.low = read_gz("low.bin.gz");
+  cal.high = read_gz("high.bin.gz");
+  cal.coefficients = {10000, 0, 10000, 0, 10000, 0, 10000, 0};
+  Radiometer r(cal, RadiometrySettings{0.95f, 23.0f, 0.6f, false});
+  auto want_t = radiometry_golden<float>("temp-switch.f32.gz");
+  auto frames = radiometry_frames("frames.raw.gz");
+  size_t k = 0;
+  bool same = true;
+  for (size_t n = 0; n < frames.size(); ++n) {
+    Frame f = frames[n];
+    f.words[HDR_FPA_TEMP] = 2750;
+    if (n == 22) r.set_settings(RadiometrySettings{0.95f, 23.0f, 0.6f, true});
+    auto t = r.feed(f);
+    if (!t) continue;
+    for (int i = 0; i < WIDTH; ++i)
+      for (int j = 0; j < HEIGHT; ++j)
+        same &= std::memcmp(&(*t)[j * WIDTH + (WIDTH - 1 - i)], &want_t[k * PIXELS + i * HEIGHT + j],
+                            sizeof(float)) == 0;
+    ++k;
+  }
+  CHECK(k == 4);
+  CHECK(same);
+}
+
+TEST(test_calibration_belongs_to_the_camera) {
+  CameraCalibration cal;
+  cal.low = read_gz("low.bin.gz");
+  cal.high = read_gz("high.bin.gz");
+  cal.validate("GHH553111C713M279");
+  CHECK(throws<WrongCamera>([&] { cal.validate("ANOTHER-SENSOR"); }, "for camera GHH553111C713M279"));
+  cal.low.resize(0x20);
+  CHECK(throws<DeviceError>([&] { cal.validate("GHH553111C713M279"); }, "unknown format"));
+}
+
+TEST(test_band_correction) {
+  std::array<int32_t, 8> c = {9799, -5252, 10751, -9489, 10417, 18752, 10428, 22419};  // this camera
+  auto near = [](float a, double b) { return std::abs(a - b) < 1e-4; };
+  CHECK(near(band_correction(-10.0f, c, false), 0.9799 * -10 - 0.5252));
+  CHECK(near(band_correction(30.0f, c, false), 1.0751 * 30 - 0.9489));
+  CHECK(near(band_correction(100.0f, c, false), 1.0417 * 100 + 1.8752));
+  CHECK(near(band_correction(120.0f, c, false), 1.0417 * 120 + 1.8752));
+  CHECK(band_correction(200.0f, c, false) == 200.0f);
+  CHECK(near(band_correction(120.0f, c, true), 1.0428 * 120 + 2.2419));  // > 100 C in high range
+  CHECK(near(band_correction(200.0f, c, true), 1.0428 * 200 + 2.2419));
+  // float32 like the vendor's Java: k * t + b rounded after the multiply (no
+  // fused multiply-add), over the whole 0..80 C band.
+  float k = float(c[2]) / 10000.0f, b = float(c[3]) / 10000.0f;
+  bool exact = true;
+  for (float t = 0.05f; t <= 80.0f; t += 0.0137f) {
+    volatile float kt = k * t;
+    exact &= band_correction(t, c, false) == kt + b;
+  }
+  CHECK(exact);
+}
+
+TEST(test_y16_matches_vendor_core_on_synthetic_frames) {
+  // Stripe clamps and thresholds, steep edges, saturation, K gear changes and
+  // bad pixels (see tests/test_radiometry.py for how the data was made).
+  auto pkg = vendor::Package::parse(read_gz("y16-synth-k.bin.gz"));
+  auto frames = radiometry_frames("y16-synth.raw.gz");
+  auto want = radiometry_golden<int16_t>("y16-synth.i16.gz");
+  CHECK(frames.size() == 7 && want.size() == 7 * size_t(PIXELS));
+  vendor::Y16Model model;
+  for (size_t k = 0; k < frames.size(); ++k) {
+    bool ok = equals_rotated(model.process(frames[k], pkg), &want[k * PIXELS]);
+    if (!ok) std::fprintf(stderr, "  synthetic frame %zu differs\n", k);
+    CHECK(ok);
+  }
+}
+
+// Minimal JSON reader for temp-sweep.json (objects, arrays, numbers, strings).
+struct Json {
+  std::variant<double, std::string, std::vector<Json>, std::map<std::string, Json>> v;
+  const Json& operator[](const std::string& key) const { return std::get<3>(v).at(key); }
+  const std::vector<Json>& array() const { return std::get<2>(v); }
+  double number() const { return std::get<0>(v); }
+  const std::string& string() const { return std::get<1>(v); }
+};
+
+Json parse_json(const char*& p) {
+  auto ws = [&] { while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') ++p; };
+  ws();
+  Json j;
+  if (*p == '[') {
+    std::vector<Json> a;
+    ++p, ws();
+    while (*p != ']') {
+      a.push_back(parse_json(p));
+      ws();
+      if (*p == ',') ++p, ws();
+    }
+    ++p;
+    j.v = std::move(a);
+  } else if (*p == '{') {
+    std::map<std::string, Json> m;
+    ++p, ws();
+    while (*p != '}') {
+      std::string key = parse_json(p).string();
+      ws(), ++p;  // ':'
+      m[key] = parse_json(p);
+      ws();
+      if (*p == ',') ++p, ws();
+    }
+    ++p;
+    j.v = std::move(m);
+  } else if (*p == '"') {
+    const char* end = std::strchr(++p, '"');
+    j.v = std::string(p, end);
+    p = end + 1;
+  } else {
+    char* end;
+    j.v = std::strtod(p, &end);
+    p = end;
+  }
+  return j;
+}
+
+TEST(test_temperature_sweep_matches_vendor_core) {
+  // Y16 -> temperature over synthetic frame headers: FPA below the first knot,
+  // between knots, on a knot and near the last one; lens and shutter drifting
+  // after every shutter transition; both ranges; emissivity 0.5..1.0; distances
+  // below, between and above the calibration distances; reflected 10..60 C.
+  auto text = read_gz("temp-sweep.json.gz");
+  text.push_back(0);
+  const char* p = reinterpret_cast<const char*>(text.data());
+  Json cases = parse_json(p);
+  CHECK(cases.array().size() == 10);
+  auto low = vendor::Package::parse(read_gz("low.bin.gz"));
+  auto high = vendor::Package::parse(read_gz("high.bin.gz"));
+  for (size_t n = 0; n < cases.array().size(); ++n) {
+    const Json& c = cases.array()[n];
+    bool hi = c["mode"].number() != 0;
+    vendor::TemperatureSettings ts{float(c["emissivity"].number()), float(c["reflected"].number()),
+                                   float(c["distance"].number())};
+    auto want = radiometry_golden<float>(c["temps_file"].string());
+    const auto& y16 = c["y16"].array();
+    vendor::MeasureState state;
+    size_t row = 0;
+    bool ok = true;
+    for (const Json& h : c["headers"].array()) {
+      int16_t words[16];
+      for (int i = 0; i < 16; ++i) words[i] = int16_t(h.array()[i].number());
+      state.update(words);
+      if (words[HDR_SHUTTER_CLOSED] != 0) continue;
+      for (size_t i = 0; i < y16.size(); ++i) {
+        float t = vendor::temperature(int(y16[i].number()), hi ? high : low, ts, state, hi);
+        ok &= std::memcmp(&t, &want[row * y16.size() + i], sizeof t) == 0;
+      }
+      ++row;
+    }
+    if (!ok) std::fprintf(stderr, "  sweep case %zu differs\n", n);
+    CHECK(ok && row * y16.size() == want.size());
+  }
+}
+
+TEST(test_pipeline_temperatures_on_replay) {
+  // The whole pipeline with radiometry: shutter frames of the calibration feed
+  // the radiometer, open frames carry temperatures.
+  std::string raw = (std::filesystem::temp_directory_path() / "uti120_radiometry_replay.raw").string();
+  {
+    auto bytes = read_gz("frames.raw.gz");
+    std::FILE* f = std::fopen(raw.c_str(), "wb");
+    std::fwrite(bytes.data(), 1, bytes.size(), f);
+    std::fclose(f);
+  }
+  CameraCalibration cal;
+  cal.low = read_gz("low.bin.gz");
+  cal.high = read_gz("high.bin.gz");
+  cal.coefficients = {9799, -5252, 10751, -9489, 10417, 18752, 10428, 22419};
+  Settings s{8, 0.0, nullptr, cal, RadiometrySettings{}};
+  Pipeline p(open_replay(raw), s);
+  CHECK(p.radiometry_enabled());
+  p.start();
+  auto im = p.newest(std::chrono::milliseconds(2000));
+  CHECK(im && im->temperature && im->temperature->size() == size_t(PIXELS));
+  if (im && im->temperature) {
+    auto [mn, mx] = std::minmax_element(im->temperature->begin(), im->temperature->end());
+    CHECK(15 < *mn && *mx < 80);
+  }
+  // A lower emissivity reads warmer once the capture thread has applied it.
+  auto mean = [](const Plane& t) { return std::accumulate(t.begin(), t.end(), 0.0) / double(t.size()); };
+  double before = im && im->temperature ? mean(*im->temperature) : 0;
+  p.set_radiometry(RadiometrySettings{0.5f, 23.0f, 0.6f, false});
+  CHECK(p.radiometry().emissivity == 0.5f);
+  long seen = p.frames_captured();
+  std::optional<Image> later;
+  for (int i = 0; i < 100 && p.frames_captured() < seen + 3; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  later = p.newest(std::chrono::milliseconds(2000));
+  CHECK(later && later->temperature && mean(*later->temperature) > before + 5);
+  p.stop();
+  Pipeline plain(open_replay(raw), Settings{});
+  CHECK(!plain.radiometry_enabled());
+  std::remove(raw.c_str());
+}
+
+TEST(test_calibration_save_load) {
+  CameraCalibration cal;
+  cal.low = {1, 2, 3};
+  cal.high = {4, 5};
+  cal.coefficients = {9799, -5252, 10751, -9489, 10417, 18752, 10428, 22419};
+  auto dir = std::filesystem::temp_directory_path() / "uti120_calibration_test";
+  cal.save(dir.string());
+  CameraCalibration back = CameraCalibration::load(dir.string());
+  CHECK(back.low == cal.low && back.high == cal.high && back.coefficients == cal.coefficients);
+  std::filesystem::remove_all(dir);
+}
+
 TEST(test_header) {
   auto closed = parse_all("closed16.bin.gz"), opened = parse_all("open4.bin.gz");
   for (auto& f : closed) CHECK(f.shutter_closed());
@@ -399,6 +719,29 @@ TEST(test_start_discards_frame_left_from_previous_session) {
   cam.start();
   CHECK(g_fake->written[0] == bytes({0x04, 0xf0, 0x01, 0, 0, 0, 2}));
   CHECK(cam.grab().frame_id() == opened[0].frame_id());
+}
+
+// A camera that sends nothing at all (the state a flash upload without a reboot
+// leaves it in) is told apart from one that sends broken frames.
+TEST(test_silent_camera_is_recognised) {
+  Camera silent = fake_camera();
+  CHECK(throws<CameraStuck>([&] { silent.grab(3); }, "needs a restart"));
+  auto frame = load("open4.bin.gz")[0];
+  Camera broken = fake_camera();
+  for (int k = 0; k < 3; ++k) {
+    g_fake->bulk.emplace_back(std::nullopt);  // drain
+    g_fake->bulk.emplace_back(std::vector<uint8_t>(frame.begin(), frame.begin() + 4096));
+    g_fake->bulk.emplace_back(std::nullopt);  // the rest never comes
+  }
+  bool silent_thrown = false, other_thrown = false;
+  try {
+    broken.grab(3);
+  } catch (const CameraStuck&) {
+    silent_thrown = true;
+  } catch (const DeviceError&) {
+    other_thrown = true;
+  }
+  CHECK(!silent_thrown && other_thrown);
 }
 
 TEST(test_grab_repeats_ignored_requests) {

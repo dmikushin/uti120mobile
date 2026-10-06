@@ -82,6 +82,7 @@ class Display {
   Display& operator=(const Display&) = delete;
 
   void show(const uint8_t* rgb);
+  void set_title(const std::string& title);
   // Handles pending window events; returns false once the user closed the window.
   bool poll();
 

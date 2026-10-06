@@ -1,7 +1,9 @@
 #include "uti120/device.hpp"
 
 #include <libusb.h>
+#include <zlib.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 
@@ -116,6 +118,22 @@ std::unique_ptr<Transport> open_usb() { return std::make_unique<LibusbTransport>
 
 std::unique_ptr<Transport> open_usb_fd(int fd) { return std::make_unique<LibusbTransport>(fd); }
 
+int usb_camera_address() {
+  libusb_context* ctx = nullptr;
+  if (libusb_init_context(&ctx, nullptr, 0) != 0) return -1;
+  libusb_device** list = nullptr;
+  ssize_t n = libusb_get_device_list(ctx, &list);
+  int found = -1;
+  for (ssize_t i = 0; i < n && found < 0; ++i) {
+    libusb_device_descriptor d;
+    if (libusb_get_device_descriptor(list[i], &d) == 0 && d.idVendor == VID && d.idProduct == PID)
+      found = (libusb_get_bus_number(list[i]) << 8) | libusb_get_device_address(list[i]);
+  }
+  if (n >= 0) libusb_free_device_list(list, 1);
+  libusb_exit(ctx);
+  return found;
+}
+
 Camera::Camera(std::unique_ptr<Transport> transport) : transport_(std::move(transport)) {}
 
 void Camera::drain_cmd() {
@@ -200,6 +218,7 @@ std::optional<std::vector<uint8_t>> Camera::read_frame_once() {
   // request is detected by a short timeout and simply repeated.
   auto first = transport_->read(EP_BULK_IN, CHUNK, FIRST_CHUNK_TIMEOUT_MS);
   auto t2 = Clock::now();
+  if (first) received_data_ = true;
   if (!first) {
     std::lock_guard lock(stats_mutex_);
     stats_.ignored++;
@@ -233,6 +252,7 @@ Frame Camera::grab(int retries) {
     stats_.total_ms += ms_between(start, Clock::now());
     if (delivered) stats_.frames++;
   };
+  received_data_ = false;
   for (int attempt = 0; attempt < retries; ++attempt) {
     auto data = read_frame_once();
     if (!data) {
@@ -263,7 +283,81 @@ Frame Camera::grab(int retries) {
     }
   }
   account(false);
+  if (!received_data_)
+    throw CameraStuck("the camera sent no data for " + std::to_string(retries) +
+                       " frame requests; it needs a restart");
   throw DeviceError("no valid frame after " + std::to_string(retries) + " requests");
+}
+
+std::vector<uint8_t> Camera::read_calibration(CalibrationPackage which) {
+  // Protocol of the vendor's UploadThread_ParamPkg.
+  const bool high = which == CalibrationPackage::High;
+  const uint32_t address = high ? 0x100000 : 0x132000;
+  const uint32_t length = read_regs(SYS_READ, high ? 12 : 13)[0];
+  if (length == 0 || length > 16 * 1024 * 1024)
+    throw DeviceError("implausible calibration package length " + std::to_string(length));
+  auto be32 = [](uint32_t v) {
+    return std::vector<uint8_t>{uint8_t(v >> 24), uint8_t(v >> 16), uint8_t(v >> 8), uint8_t(v)};
+  };
+  auto transfer = [&](uint8_t offset, std::vector<uint8_t> values) {
+    std::vector<uint8_t> req{TRANSFER, offset, uint8_t(values.size() / 4)};
+    req.insert(req.end(), values.begin(), values.end());
+    auto reply = transact(req);
+    if (reply.size() < 3 || reply[0] != req[0] || reply[1] != req[1] || reply[2] != req[2])
+      throw DeviceError("bad reply to transfer command " + hex(req) + ": " + hex(reply));
+  };
+
+  // Stop the camera first, then discard whatever is still in flight, with
+  // short reads only.  Measured: after a completed upload, a 100 ms bulk read
+  // in idle makes the next upload stall with no data until a reboot, a 10 ms
+  // one does not; and a frame requested but not read before going idle is not
+  // delivered to 10 ms reads, the package then arrives intact (3/3 each).
+  set_run_status(RUN_IDLE);
+  while (auto stale = transport_->read(EP_BULK_IN, CHUNK, DRAIN_TIMEOUT_MS))
+    LOG_DEBUG(LOG, "discarded %zu stale bulk bytes before the upload", stale->size());
+  set_run_status(RUN_UPLOAD);
+  {
+    auto v = be32(address);
+    auto n = be32(length);
+    v.insert(v.end(), n.begin(), n.end());
+    transfer(0, v);  // begin
+  }
+  std::vector<uint8_t> data;
+  data.reserve(length);
+  while (data.size() < length) {
+    auto block = transport_->read(EP_BULK_IN, CHUNK, 1000);
+    if (!block && data.empty())
+      throw CameraStuck("calibration upload: the camera sent no data; it needs a restart");
+    if (!block) throw DeviceError("calibration upload stalled after " + std::to_string(data.size()) + " bytes");
+    // Every package starts with its header length (0xd8) and "TI_CAL_METHOD".
+    static const uint8_t head[] = {0xd8, 0, 0, 0, 'T', 'I', '_', 'C', 'A', 'L'};
+    if (data.empty() &&
+        (block->size() < sizeof head || !std::equal(head, head + sizeof head, block->begin())))
+      throw CameraStuck("calibration upload: the first " + std::to_string(block->size()) +
+                        " bytes are not a calibration package (stale data from an interrupted stream?): " +
+                        hex(std::vector<uint8_t>(block->begin(), block->begin() + std::min<size_t>(block->size(), 16))));
+    uint32_t crc = uint32_t(crc32(0L, block->data(), uInt(block->size())));
+    auto v = be32(crc);
+    auto n = be32(uint32_t(block->size()));
+    v.insert(v.end(), n.begin(), n.end());
+    transfer(2, v);  // acknowledge the block
+    data.insert(data.end(), block->begin(), block->end());
+  }
+  if (data.size() != length)
+    throw DeviceError("calibration upload: got " + std::to_string(data.size()) + " bytes, expected " +
+                      std::to_string(length));
+  transfer(4, be32(uint32_t(crc32(0L, data.data(), uInt(data.size())))));  // end
+  set_run_status(RUN_IDLE);
+  LOG_INFO(LOG, "read %s calibration package: %u bytes", high ? "high" : "low", length);
+  return data;
+}
+
+void Camera::reboot() {
+  try {
+    write_reg(SYS_WRITE, REG_REBOOT, 1);
+  } catch (const DeviceError&) {
+    // it may leave the bus before it answers
+  }
 }
 
 void Camera::start() {

@@ -50,10 +50,24 @@ android {
     }
 
     buildTypes {
+        debug {
+            // Native code optimised in debug builds too: unoptimised, the
+            // backend's per-frame work halves the frame rate (measured in the
+            // emulator: 11-12 fps and 10 ms render instead of 21-22 fps and
+            // 0.9 ms).  AGP forces CMAKE_BUILD_TYPE=Debug, whose NDK flags set
+            // no -O level, so -O2 is added to the flags; -g stays, and Kotlin
+            // stays debuggable.
+            externalNativeBuild {
+                cmake {
+                    cFlags += "-O2"
+                    cppFlags += "-O2"
+                }
+            }
+        }
         release {
             isMinifyEnabled = true
             isShrinkResources = true
-            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             signingConfig = signingConfigs.findByName("release")
         }
     }
