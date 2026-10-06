@@ -3,6 +3,13 @@ package io.github.dmikushin.uti120
 import android.graphics.Bitmap
 import androidx.core.graphics.createBitmap
 
+/**
+ * uti120::CameraStuck: the camera answers commands but sends no data, a state
+ * only a restart ends (e.g. a process died between a calibration read and the
+ * restart that must follow it).  Thrown from native code.
+ */
+class CameraStuckException(message: String) : RuntimeException(message)
+
 /** How the image is shown; mirrors uti120::View in the native backend. */
 data class ViewSettings(
     val palette: String = "ironbow",
@@ -158,6 +165,9 @@ class NativeCamera private constructor(
         /** The sensor id of the camera behind [fd]; names its calibration cache. */
         fun sensorId(fd: Int): String = nativeSensorId(fd)
 
+        /** Restarts the camera behind [fd]; it then leaves the bus and enumerates again. */
+        fun reboot(fd: Int) = nativeReboot(fd)
+
         /** The sensor id if the camera answers and has finished starting up, else null. */
         fun probe(fd: Int): String? = nativeProbe(fd)
 
@@ -183,6 +193,7 @@ class NativeCamera private constructor(
         )
         @JvmStatic private external fun nativeSensorId(fd: Int): String
         @JvmStatic private external fun nativeProbe(fd: Int): String?
+        @JvmStatic private external fun nativeReboot(fd: Int)
         @JvmStatic private external fun nativeCheckCalibration(dir: String, sensor: String): String?
         @JvmStatic private external fun nativeReadCalibration(fd: Int, dir: String)
         @JvmStatic private external fun nativeSetView(

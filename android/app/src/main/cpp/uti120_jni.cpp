@@ -24,16 +24,21 @@ namespace {
 
 Pipeline* from_handle(jlong h) { return reinterpret_cast<Pipeline*>(h); }
 
-void throw_java(JNIEnv* env, const char* msg) {
+void throw_java(JNIEnv* env, const char* msg, const char* cls_name = "java/lang/RuntimeException") {
   if (env->ExceptionCheck()) return;
-  jclass cls = env->FindClass("java/lang/RuntimeException");
+  jclass cls = env->FindClass(cls_name);
+  if (!cls) return;  // NoClassDefFoundError is pending
   env->ThrowNew(cls, msg);
 }
 
+// uti120::CameraStuck becomes CameraStuckException, which the app answers by
+// restarting the camera; every other native failure a RuntimeException.
 template <class F>
 auto guarded(JNIEnv* env, F&& f, decltype(f()) fallback) -> decltype(f()) {
   try {
     return f();
+  } catch (const CameraStuck& e) {
+    throw_java(env, e.what(), "io/github/dmikushin/uti120/CameraStuckException");
   } catch (const std::exception& e) {
     throw_java(env, e.what());
   } catch (...) {
@@ -205,11 +210,17 @@ JNIEXPORT void JNICALL Java_io_github_dmikushin_uti120_NativeCamera_nativeReadCa
     std::string path = to_string(env, dir);
     Camera cam(open_usb_fd(fd));
     read_camera_calibration(cam).save(path);
-    try {
-      cam.write_reg(SYS_WRITE, REG_REBOOT, 1);
-    } catch (const DeviceError&) {
-      // the camera may go away before it answers
-    }
+    cam.reboot();
+    return 0;
+  }, 0);
+}
+
+// Restarts the camera behind `fd` (the remedy for CameraStuck); it then leaves
+// the bus and enumerates again, the caller closes `fd`.
+JNIEXPORT void JNICALL Java_io_github_dmikushin_uti120_NativeCamera_nativeReboot(
+    JNIEnv* env, jclass, jint fd) {
+  guarded(env, [&] {
+    Camera(open_usb_fd(fd)).reboot();
     return 0;
   }, 0);
 }

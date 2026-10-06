@@ -98,6 +98,8 @@ class CameraController(private val context: Context) {
     private var videoUri: Uri? = null
     // The camera restarted after its calibration was read; the one that comes back must be it.
     private var restartedSensor: String? = null
+    // A stuck camera is restarted once per connection attempt (worker thread).
+    @Volatile private var stuckRetried = false
     // Device name the open permission request is for (main thread).
     private var permissionFor: String? = null
     // Set when the camera has gone off the bus during its restart (any thread).
@@ -158,6 +160,7 @@ class CameraController(private val context: Context) {
     fun connect() {
         // Also triggered by USB_DEVICE_ATTACHED while a permission request is open.
         if (phase in BUSY_PHASES || phase == Phase.AwaitingPermission) return
+        if (phase == Phase.Failed) stuckRetried = false  // the user's Retry: a fresh attempt
         replay?.let { path ->
             // Debug: temperatures too if a calibration was put into files/calibration/replay.
             val dir = File(context.filesDir, "calibration/replay").takeIf { File(it, "coefficients.json").exists() }
@@ -218,8 +221,16 @@ class CameraController(private val context: Context) {
         publish(partial, dir)
         connection = null
         conn.close()
-        // A session that ended during the read (activity stopped, camera
-        // unplugged) must not leave its expectation to a later, unrelated connect.
+        awaitRestart(before, sensor, id)
+    }
+
+    /**
+     * Worker: after the camera was told to restart, waits for it and connects
+     * again (expecting the same sensor).  A session that ended meanwhile
+     * (activity stopped, camera unplugged) does nothing, so it cannot leave its
+     * expectation to a later, unrelated connect.
+     */
+    private fun awaitRestart(before: String?, sensor: String, id: Int) {
         if (session != id) return
         restartedSensor = sensor
         main.post { if (session == id) setPhase(Phase.Restarting, "") }
@@ -231,6 +242,29 @@ class CameraController(private val context: Context) {
             setPhase(Phase.NoCamera, "")
             connect()
         }
+    }
+
+    /**
+     * Worker: the remedy for CameraStuckException — restart the camera and,
+     * once it is back, connect again.  Applied once per connection attempt
+     * (stuckRetried); the second time the error reaches the user.
+     */
+    private fun recoverStuck(e: CameraStuckException, id: Int) {
+        Log.w(TAG, "camera stuck, restarting it: ${e.message}")
+        // Release the stuck pipeline and its claim on the interfaces first, then
+        // talk to the camera on a fresh connection.
+        closeCamera()
+        val device = usb.deviceList.values.firstOrNull(::isCamera) ?: error("the camera is gone")
+        val conn = usb.openDevice(device) ?: error("cannot open the USB device")
+        val sensor = try {
+            val answer = NativeCamera.sensorId(conn.fileDescriptor)  // a stuck camera still answers commands
+            detachedSinceRestart = false
+            NativeCamera.reboot(conn.fileDescriptor)
+            answer
+        } finally {
+            conn.close()
+        }
+        awaitRestart(device.deviceName, sensor, id)
     }
 
     /**
@@ -265,7 +299,10 @@ class CameraController(private val context: Context) {
      */
     private fun waitForCamera(before: String?, id: Int): String? {
         val started = SystemClock.uptimeMillis()
-        // The camera answers the reboot command and only then resets.
+        // After the reboot command the old device stays on the bus and answers
+        // in its old state for about 1.0 s (measured on the desktop); the new
+        // one reports init status 1 after about 3.3 s.  Nothing is probed in
+        // that first window, so an answer is never the old device's.
         Thread.sleep(RESTART_MIN_MS)
         var slowShown = false
         while (session == id) {
@@ -307,7 +344,21 @@ class CameraController(private val context: Context) {
                 camera = cam
                 cam.start()
                 startRendering(cam, id)
+                stuckRetried = false
                 main.post { if (session == id) setPhase(Phase.Live, "") }
+            } catch (e: CameraStuckException) {
+                if (!stuckRetried) {
+                    stuckRetried = true
+                    try {
+                        recoverStuck(e, id)
+                        return@execute
+                    } catch (r: Exception) {
+                        Log.e(TAG, "restarting the stuck camera failed", r)
+                    }
+                }
+                Log.e(TAG, "camera start failed", e)
+                closeCamera()
+                main.post { if (session == id) fail(e.message ?: e.toString()) }
             } catch (e: Exception) {
                 Log.e(TAG, "camera start failed", e)
                 closeCamera()
