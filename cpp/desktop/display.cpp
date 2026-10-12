@@ -59,6 +59,10 @@ void Display::show(const uint8_t* rgb) {
   SDL_RenderPresent(m.renderer);
 }
 
+void Display::set_title(const std::string& title) {
+  SDL_SetWindowTitle(impl_->window, title.c_str());
+}
+
 bool Display::poll() {
   SDL_Event ev;
   while (SDL_PollEvent(&ev)) {

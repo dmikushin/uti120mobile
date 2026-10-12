@@ -19,6 +19,7 @@
 #include "uti120/device.hpp"
 #include "uti120/palette.hpp"
 #include "uti120/process.hpp"
+#include "uti120/radiometry.hpp"
 #include "uti120/stream.hpp"
 
 namespace uti120 {
@@ -56,6 +57,9 @@ struct Settings {
   int dark_frames = 16;
   double recalibrate_s = 0.0;      // periodic shutter recalibration, 0 = never
   std::FILE* raw_sink = nullptr;   // receives every raw frame if set (not owned)
+  // With the camera's calibration, images carry temperatures (Image::temperature).
+  std::optional<CameraCalibration> calibration = std::nullopt;
+  RadiometrySettings radiometry = {};
 };
 
 class Pipeline {
@@ -78,9 +82,18 @@ class Pipeline {
   // none arrived in time or the pipeline is stopped.  Rethrows a capture error.
   std::optional<Image> newest(std::chrono::milliseconds wait);
   // Mean signal of the next n captured images.
-  Plane snapshot(int n, Frame* last = nullptr);
+  // With radiometry, `temperature` (if given) receives the mean temperatures
+  // of those of the n images that carry temperatures (all of them once the
+  // pipeline has started: the start-up shutter frames are the reference).
+  Plane snapshot(int n, Frame* last = nullptr, Plane* temperature = nullptr);
   // The capture thread recalibrates on the shutter before its next frame.
   void request_recalibration() { recalibrate_ = true; }
+
+  // Thread-safe; applied by the capture thread before its next frame (or at
+  // start()).  Without a calibration in Settings it only records the settings.
+  void set_radiometry(const RadiometrySettings& settings);
+  RadiometrySettings radiometry();
+  bool radiometry_enabled() const { return radiometry_enabled_; }
 
   RgbImage render(const Plane& signal);
   void set_view(const View& view);
@@ -91,6 +104,7 @@ class Pipeline {
 
  private:
   void run();
+  void apply_radiometry();  // on the capture thread, or under lifecycle_ before it runs
 
   std::mutex lifecycle_;  // serialises start() and stop()
   Camera cam_;
@@ -107,6 +121,11 @@ class Pipeline {
   std::atomic<bool> recalibrate_{false};
   bool streaming_ = false;
   std::thread thread_;
+
+  const bool radiometry_enabled_;
+  std::mutex radiometry_mutex_;
+  RadiometrySettings radiometry_;
+  bool radiometry_pending_ = false;
 };
 
 }  // namespace uti120

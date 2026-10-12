@@ -17,3 +17,6 @@ uti120 = "uti120.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+uti120 = ["data/*.bin"]
